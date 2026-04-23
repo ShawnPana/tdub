@@ -1,4 +1,4 @@
-const { app, BrowserWindow, WebContentsView, ipcMain } = require('electron');
+const { app, BrowserWindow, WebContentsView, ipcMain, session } = require('electron');
 
 const path = require('path');
 const os = require('os');
@@ -9,7 +9,7 @@ const pty = require('node-pty');
 // bot walls scan for these signals.
 //   - `AutomationControlled` Blink feature sets navigator.webdriver = true
 //     and adds related automation signals; disable it.
-//   - Strip "tdub/x.y.z" and "Electron/x.y.z" from the default user agent
+//   - Strip "terminum/x.y.z" and "Electron/x.y.z" from the default user agent
 //     so pages see a plain Chrome UA, not an Electron-branded one.
 //   - Enable Chromium's remote-debugging so CDP is available at runtime
 //     (0 = auto-select port); allow any origin since we gate externally.
@@ -18,7 +18,7 @@ app.commandLine.appendSwitch('remote-debugging-port', '0');
 app.commandLine.appendSwitch('remote-debugging-address', '127.0.0.1');
 app.commandLine.appendSwitch('remote-allow-origins', '*');
 app.userAgentFallback = (app.userAgentFallback || '')
-  .replace(/\s?tdub\/\S+/, '')
+  .replace(/\s?terminum\/\S+/, '')
   .replace(/\s?Electron\/\S+/, '');
 
 // Boot-time config read: certain settings (like userData path) must be
@@ -26,12 +26,12 @@ app.userAgentFallback = (app.userAgentFallback || '')
 // via loadConfigFromDisk in whenReady().
 (function applyBootConfig() {
   try {
-    const bootCfgPath = path.join(os.homedir(), '.config', 'tdub', 'config.json');
+    const bootCfgPath = path.join(os.homedir(), '.config', 'terminum', 'config.json');
     const raw = fs.readFileSync(bootCfgPath, 'utf8');
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed.profileDir === 'string' && parsed.profileDir.trim()) {
       const dir = parsed.profileDir.trim().replace(/^~(?=\/|$)/, os.homedir());
-      try { app.setPath('userData', dir); } catch (e) { console.warn('[tdub] profileDir:', e.message); }
+      try { app.setPath('userData', dir); } catch (e) { console.warn('[terminum] profileDir:', e.message); }
     }
   } catch {}
 })();
@@ -39,10 +39,18 @@ app.userAgentFallback = (app.userAgentFallback || '')
 const APP_DIR = __dirname;
 const BIN_DIR = path.join(APP_DIR, 'bin');
 const CHROME_HTML = path.join(APP_DIR, 'browser-chrome.html');
+const CONFIG_UI_HTML = path.join(APP_DIR, 'config-ui.html');
+const BROWSER_PRELOAD = path.join(APP_DIR, 'browser-preload.js');
 const CHROME_BAR_HEIGHT = 28;
-const WORKSPACE_BAR_HEIGHT = 22;
+const WORKSPACE_BAR_BASE_HEIGHT = 22;
 
-const CONFIG_DIR = path.join(os.homedir(), '.config', 'tdub');
+function currentBarHeight(world) {
+  const fs = Math.max(6, Math.min(72, (termConfig && termConfig.fontSize || 13) + (world.zoomDelta || 0)));
+  // Scale bar height proportionally to terminal font size (min 22px).
+  return Math.max(WORKSPACE_BAR_BASE_HEIGHT, Math.round(fs * 1.7));
+}
+
+const CONFIG_DIR = path.join(os.homedir(), '.config', 'terminum');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
 const DEFAULTS_PATH = path.join(CONFIG_DIR, 'defaults.json');
 
@@ -72,6 +80,7 @@ const DEFAULT_BINDINGS = {
   // Browser engage
   engage:           ['Cmd+Enter'],
   disengage:        ['Alt+Escape'],
+  devtools:         ['Cmd+Alt+I'],
 };
 
 const DEFAULT_TERMINAL = {
@@ -84,12 +93,23 @@ const DEFAULT_TERMINAL = {
 
 const DEFAULT_WINDOW = { width: 1000, height: 650 };
 
+// Default colors mirror smux's tmux.conf:
+//   pane-border-style fg=colour236              → #303030
+//   pane-active-border-style fg=red             → #cd0000
+//   status-style bg=default,fg=colour245        → bg=#000000, fg=#8a8a8a
+//   window-status-current-style fg=red,bold     → #cd0000, bold
 const DEFAULT_PANES = {
-  border: { inactive: '#2a2a2a', focused: '#4a9eff', width: 1 },
+  border: { inactive: '#303030', focused: '#cd0000', width: 1 },
 };
 
 const DEFAULT_WORKSPACES = {
-  wrap: true, // nextWorkspace at the last wraps to first; prev at first wraps to last
+  wrap: true,
+  background:       '#000000',
+  foreground:       '#8a8a8a',
+  activeForeground: '#cd0000',
+  borderTop:        '#303030',
+  hoverBackground:  '#1a1a1a',
+  hoverForeground:  '#dddddd',
 };
 
 let bindings = DEFAULT_BINDINGS;
@@ -152,14 +172,83 @@ function mergeDeep(defaults, patch) {
   return out;
 }
 
+let lastConfigError = null;
+
+function pushConfigError(msg) {
+  lastConfigError = msg;
+  for (const world of worlds.values()) {
+    if (world.rendererReady && !world.win.isDestroyed()) {
+      world.termView.webContents.send('config-error', { message: msg });
+    }
+  }
+}
+
+function validateConfig(parsed) {
+  const errors = [];
+  const validActions = new Set(Object.keys(DEFAULT_BINDINGS));
+
+  if (parsed.keybindings !== undefined) {
+    if (!parsed.keybindings || typeof parsed.keybindings !== 'object' || Array.isArray(parsed.keybindings)) {
+      errors.push('keybindings must be an object');
+    } else {
+      for (const [action, chords] of Object.entries(parsed.keybindings)) {
+        if (!validActions.has(action)) {
+          errors.push(`unknown action "${action}" (valid: ${[...validActions].sort().join(', ')})`);
+          continue;
+        }
+        const list = Array.isArray(chords) ? chords : (typeof chords === 'string' ? [chords] : null);
+        if (!list) { errors.push(`keybindings.${action}: must be a string or array of strings`); continue; }
+        for (const chord of list) {
+          if (typeof chord !== 'string') { errors.push(`keybindings.${action}: chord must be a string`); continue; }
+          const c = parseChord(chord);
+          if (!c.key) errors.push(`keybindings.${action}: chord "${chord}" has no key`);
+        }
+      }
+    }
+  }
+
+  // Type sanity on other sections.
+  if (parsed.terminal !== undefined && (typeof parsed.terminal !== 'object' || Array.isArray(parsed.terminal))) {
+    errors.push('terminal must be an object');
+  }
+  if (parsed.window !== undefined && (typeof parsed.window !== 'object' || Array.isArray(parsed.window))) {
+    errors.push('window must be an object');
+  }
+  if (parsed.panes !== undefined && (typeof parsed.panes !== 'object' || Array.isArray(parsed.panes))) {
+    errors.push('panes must be an object');
+  }
+  if (parsed.workspaces !== undefined && (typeof parsed.workspaces !== 'object' || Array.isArray(parsed.workspaces))) {
+    errors.push('workspaces must be an object');
+  }
+
+  return errors;
+}
+
 function loadConfigFromDisk() {
   let parsed = null;
   try {
     const raw = fs.readFileSync(CONFIG_PATH, 'utf8');
     parsed = JSON.parse(raw);
   } catch (e) {
-    if (e.code !== 'ENOENT') console.warn('[tdub] config load:', e.message);
+    if (e.code === 'ENOENT') {
+      parsed = {};
+    } else {
+      const msg = `config syntax: ${e.message}`;
+      console.warn('[terminum]', msg);
+      pushConfigError(msg);
+      return;
+    }
   }
+
+  const errors = validateConfig(parsed);
+  if (errors.length > 0) {
+    const msg = `config: ${errors.join('; ')}`;
+    console.warn('[terminum]', msg);
+    pushConfigError(msg);
+    return; // don't apply a semantically-broken config
+  }
+
+  if (lastConfigError) pushConfigError(null);
 
   if (parsed && parsed.keybindings && typeof parsed.keybindings === 'object') {
     const next = { ...DEFAULT_BINDINGS };
@@ -186,8 +275,9 @@ function pushRuntimeConfig(world) {
   world.termView.webContents.send('config-update', {
     terminal: { ...termConfig, fontSize: effectiveFontSize },
     panes: paneConfig,
+    workspaces: workspaceConfig,
     bindings,
-    barHeight: WORKSPACE_BAR_HEIGHT,
+    barHeight: currentBarHeight(world),
   });
 }
 
@@ -223,7 +313,7 @@ function writeDefaultsFile() {
   try {
     fs.mkdirSync(CONFIG_DIR, { recursive: true });
     const content = {
-      _comment: 'tdub defaults — regenerated every launch, do not edit. Copy lines from here into config.json to override.',
+      _comment: 'terminum defaults — regenerated every launch, do not edit. Copy lines from here into config.json to override.',
       _reference: CONFIG_REFERENCE,
       keybindings: DEFAULT_BINDINGS,
       terminal: DEFAULT_TERMINAL,
@@ -232,7 +322,7 @@ function writeDefaultsFile() {
       workspaces: DEFAULT_WORKSPACES,
     };
     fs.writeFileSync(DEFAULTS_PATH, JSON.stringify(content, null, 2));
-  } catch (e) { console.warn('[tdub] writeDefaultsFile:', e.message); }
+  } catch (e) { console.warn('[terminum] writeDefaultsFile:', e.message); }
 }
 
 // User's config.json — seeded as a minimal stub. Anything not overridden
@@ -247,7 +337,7 @@ function ensureConfigFile() {
       };
       fs.writeFileSync(CONFIG_PATH, JSON.stringify(seed, null, 2));
     }
-  } catch (e) { console.warn('[tdub] ensureConfigFile:', e.message); }
+  } catch (e) { console.warn('[terminum] ensureConfigFile:', e.message); }
 }
 
 function watchConfig() {
@@ -255,7 +345,7 @@ function watchConfig() {
     fs.watchFile(CONFIG_PATH, { interval: 400, persistent: false }, (curr, prev) => {
       if (curr.mtimeMs !== prev.mtimeMs || curr.size !== prev.size) loadConfigFromDisk();
     });
-  } catch (e) { console.warn('[tdub] watchConfig:', e.message); }
+  } catch (e) { console.warn('[terminum] watchConfig:', e.message); }
 }
 
 // ---------- state ----------
@@ -289,7 +379,7 @@ function ptyEnv() {
     ...process.env,
     TERM: 'xterm-256color',
     PATH: `${BIN_DIR}:${process.env.PATH || ''}`,
-    TDUB_BIN: BIN_DIR,
+    TERMINUM_BIN: BIN_DIR,
     ZDOTDIR: path.join(APP_DIR, 'shell', 'zsh'),
   };
 }
@@ -436,7 +526,7 @@ async function combinedSuggest(query) {
 
 function contentRect(world) {
   const wb = world.win.getContentBounds();
-  return { x: 0, y: 0, w: wb.width, h: Math.max(0, wb.height - WORKSPACE_BAR_HEIGHT) };
+  return { x: 0, y: 0, w: wb.width, h: Math.max(0, wb.height - currentBarHeight(world)) };
 }
 
 function layoutNode(node, rect, out) {
@@ -471,15 +561,22 @@ function layoutWorld(world) {
       try { pane.view.setBounds({ x: ix, y: iy + barH, width: iw, height: Math.max(0, ih - barH) }); } catch {}
       try { pane.view.setVisible(true); } catch {}
       try { pane.chromeView.setVisible(true); } catch {}
+    } else if (pane.kind === 'config') {
+      const ix = r.x + 1, iy = r.y + 1;
+      const iw = Math.max(0, r.w - 2), ih = Math.max(0, r.h - 2);
+      try { pane.view.setBounds({ x: ix, y: iy, width: iw, height: ih }); } catch {}
+      try { pane.view.setVisible(true); } catch {}
     }
   }
-  // Hide browser panes of inactive workspaces.
+  // Hide WebContentsView panes of inactive workspaces.
   for (const otherWs of world.workspaces) {
     if (otherWs === ws) continue;
     for (const p of otherWs.panes.values()) {
       if (p.kind === 'browser') {
         try { p.view.setVisible(false); } catch {}
         try { p.chromeView.setVisible(false); } catch {}
+      } else if (p.kind === 'config') {
+        try { p.view.setVisible(false); } catch {}
       }
     }
   }
@@ -519,8 +616,11 @@ function destroyPaneResources(world, pane) {
     try { pane.chromeView.webContents.close(); } catch {}
     try { world.win.contentView.removeChildView(pane.view); } catch {}
     try { pane.view.webContents.close(); } catch {}
-    const n = Number(pane.pid || '');
-    if (Number.isFinite(n)) { try { process.kill(n, 'SIGTERM'); } catch {} }
+    const n = pane.pid ? Number(pane.pid) : NaN;
+    if (Number.isFinite(n) && n > 0) { try { process.kill(n, 'SIGTERM'); } catch {} }
+  } else if (pane.kind === 'config') {
+    try { world.win.contentView.removeChildView(pane.view); } catch {}
+    try { pane.view.webContents.close(); } catch {}
   }
   if (world.rendererReady) {
     world.termView.webContents.send('pane-remove', { paneId: pane.id });
@@ -624,7 +724,9 @@ function pushFocus(world) {
   if (!ws) return;
   world.termView.webContents.send('focus', { paneId: ws.focusedPaneId });
   const pane = ws.panes.get(ws.focusedPaneId);
-  if (pane && pane.kind === 'browser' && pane.engaged) {
+  if (pane && pane.kind === 'config') {
+    try { pane.view.webContents.focus(); } catch {}
+  } else if (pane && pane.kind === 'browser' && pane.engaged) {
     try { pane.view.webContents.focus(); } catch {}
   } else {
     try { world.termView.webContents.focus(); } catch {}
@@ -661,6 +763,9 @@ function applyZoom(world, step) {
   if (step === 0) world.zoomDelta = 0;
   else world.zoomDelta = (world.zoomDelta || 0) + step;
   pushRuntimeConfig(world);
+  // Bar height is derived from zoom; re-layout so panes shrink/grow to
+  // leave the right room above the bar.
+  layoutWorld(world);
 }
 
 // ---------- workspaces ----------
@@ -737,7 +842,12 @@ function convertToBrowser(world, paneId, url, pid) {
   ws.panes.delete(paneId);
 
   const view = new WebContentsView({
-    webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false },
+    webPreferences: {
+      // contextIsolation must be false for the preload to patch
+      // `navigator.userAgentData` in the same context the page sees.
+      sandbox: false, contextIsolation: false, nodeIntegration: false,
+      preload: BROWSER_PRELOAD,
+    },
   });
   const chromeView = new WebContentsView({
     webPreferences: { nodeIntegration: true, contextIsolation: false, sandbox: false },
@@ -778,6 +888,38 @@ function convertToBrowser(world, paneId, url, pid) {
   view.webContents.on('before-input-event', onInput);
   chromeView.webContents.on('before-input-event', onInput);
 
+  // Allow window.open popups (Google OAuth uses them). Open as a real
+  // BrowserWindow with the same stealth preload so the sign-in flow
+  // sees matching navigator.userAgentData, sec-ch-ua, etc.
+  view.webContents.setWindowOpenHandler((details) => {
+    console.log('[popup]', JSON.stringify({ url: details.url, disposition: details.disposition, features: details.features }));
+    return {
+      action: 'allow',
+      overrideBrowserWindowOptions: {
+        width: 520, height: 680,
+        backgroundColor: '#ffffff',
+        webPreferences: {
+          sandbox: false, contextIsolation: false, nodeIntegration: false,
+          preload: BROWSER_PRELOAD,
+        },
+      },
+    };
+  });
+  view.webContents.on('did-create-window', (win, { url }) => {
+    console.log('[popup] did-create-window', url);
+  });
+  // Auto-accept common permission requests (microphone, clipboard, etc.).
+  // Google sign-in can gate on these silently.
+  view.webContents.session.setPermissionRequestHandler((wc, perm, cb) => {
+    console.log('[permission]', perm);
+    cb(true);
+  });
+  // Log failed loads so we notice blocked subresources.
+  view.webContents.on('did-fail-load', (_e, code, desc, url, isMainFrame) => {
+    if (code === -3) return; // aborted (common, benign)
+    console.log('[load-fail]', code, desc, url, 'main=' + isMainFrame);
+  });
+
   world.win.contentView.addChildView(view);
   world.win.contentView.addChildView(chromeView);
   layoutWorld(world);
@@ -788,13 +930,16 @@ function convertToTerminal(world, paneId) {
   const ws = activeWs(world);
   if (!ws) return;
   const pane = ws.panes.get(paneId);
-  if (!pane || pane.kind !== 'browser') return;
-  try { world.win.contentView.removeChildView(pane.chromeView); } catch {}
-  try { pane.chromeView.webContents.close(); } catch {}
+  if (!pane || (pane.kind !== 'browser' && pane.kind !== 'config')) return;
+  try { world.termView.webContents.focus(); } catch {}
+  if (pane.chromeView) {
+    try { world.win.contentView.removeChildView(pane.chromeView); } catch {}
+  }
   try { world.win.contentView.removeChildView(pane.view); } catch {}
-  try { pane.view.webContents.close(); } catch {}
-  const n = Number(pane.pid || '');
-  if (Number.isFinite(n)) { try { process.kill(n, 'SIGTERM'); } catch {} }
+  // process.kill(0) targets the whole process group (kills tdub itself).
+  // Require a positive integer pid.
+  const n = pane.pid ? Number(pane.pid) : NaN;
+  if (Number.isFinite(n) && n > 0) { try { process.kill(n, 'SIGTERM'); } catch {} }
 
   const termPane = { id: paneId, kind: 'term', pty: null, rect: pane.rect };
   ws.panes.set(paneId, termPane);
@@ -845,6 +990,16 @@ function dispatchAction(world, action) {
     case 'zoomIn':         applyZoom(world, +1); return true;
     case 'zoomOut':        applyZoom(world, -1); return true;
     case 'zoomReset':      applyZoom(world, 0); return true;
+    case 'devtools': {
+      if (!ws) return true;
+      const p = ws.panes.get(ws.focusedPaneId);
+      if (p && (p.kind === 'browser' || p.kind === 'config')) {
+        try { p.view.webContents.toggleDevTools({ mode: 'detach' }); } catch {}
+      } else if (p && p.kind === 'term') {
+        try { world.termView.webContents.toggleDevTools({ mode: 'detach' }); } catch {}
+      }
+      return true;
+    }
     case 'engage': {
       if (!ws) return true;
       const p = ws.panes.get(ws.focusedPaneId);
@@ -885,7 +1040,7 @@ function newWindow() {
   const win = new BrowserWindow({
     width: windowConfig.width || 1000,
     height: windowConfig.height || 650,
-    title: 'tdub',
+    title: 'Terminum',
     backgroundColor: '#000000',
   });
 
@@ -944,8 +1099,8 @@ function newWindow() {
       for (const p of ws.panes.values()) {
         if (p.kind === 'term') { try { p.pty && p.pty.kill(); } catch {} }
         if (p.kind === 'browser') {
-          const n = Number(p.pid || '');
-          if (Number.isFinite(n)) { try { process.kill(n, 'SIGTERM'); } catch {} }
+          const n = p.pid ? Number(p.pid) : NaN;
+          if (Number.isFinite(n) && n > 0) { try { process.kill(n, 'SIGTERM'); } catch {} }
         }
       }
     }
@@ -962,6 +1117,9 @@ ipcMain.on('renderer-ready', (e) => {
     if (world.termView.webContents === e.sender) {
       world.rendererReady = true;
       pushRuntimeConfig(world);
+      if (lastConfigError) {
+        world.termView.webContents.send('config-error', { message: lastConfigError });
+      }
       for (const ws of world.workspaces) {
         for (const pane of ws.panes.values()) {
           if (pane.kind === 'term') {
@@ -1019,7 +1177,21 @@ ipcMain.on('rename-workspace', (e, { idx, name }) => {
   }
 });
 
-ipcMain.on('tdub-browse', (e, { paneId, pid, url }) => {
+ipcMain.on('preload-debug', (_e, payload) => {
+  try { console.log('[preload]', JSON.stringify(payload)); } catch {}
+});
+
+ipcMain.on('terminum-config', (e) => {
+  for (const world of worlds.values()) {
+    if (world.termView.webContents !== e.sender) continue;
+    const ws = activeWs(world);
+    if (!ws) return;
+    convertToConfig(world, ws.focusedPaneId);
+    return;
+  }
+});
+
+ipcMain.on('terminum-browse', (e, { paneId, pid, url }) => {
   for (const world of worlds.values()) {
     if (world.termView.webContents !== e.sender) continue;
     const ws = activeWs(world);
@@ -1079,12 +1251,161 @@ ipcMain.on('nav-url', (e, raw) => {
 ipcMain.handle('omnibox-suggest', (_e, query) => combinedSuggest(query || ''));
 
 app.whenReady().then(() => {
+  // Spoof client hints and ua-branding so Google sign-in doesn't treat us
+  // as an embedded webview. Electron only reports "Chromium" by default;
+  // real Chrome also reports a "Google Chrome" brand.
+  const chromeFull = process.versions.chrome || '146.0.0.0';
+  const chromeMajor = chromeFull.split('.')[0];
+  const brandShort = `"Chromium";v="${chromeMajor}", "Google Chrome";v="${chromeMajor}", "Not?A_Brand";v="99"`;
+  const brandFull  = `"Chromium";v="${chromeFull}", "Google Chrome";v="${chromeFull}", "Not?A_Brand";v="99.0.0.0"`;
+  try {
+    session.defaultSession.webRequest.onBeforeSendHeaders((details, callback) => {
+      const h = details.requestHeaders;
+      // Only rewrite if Chromium sent any ua hint in the first place (avoids
+      // sending unsolicited headers on requests that didn't ask for them).
+      if (h['sec-ch-ua'] !== undefined) h['sec-ch-ua'] = brandShort;
+      if (h['sec-ch-ua-full-version-list'] !== undefined) h['sec-ch-ua-full-version-list'] = brandFull;
+      callback({ requestHeaders: h });
+    });
+  } catch (e) { console.warn('[terminum] sec-ch-ua hook:', e.message); }
+
   writeDefaultsFile();
   ensureConfigFile();
   loadConfigFromDisk();
   watchConfig();
   loadHistory();
   newWindow();
+});
+
+// ---------- config pane ----------
+
+// Reduce a full config to just the fields that differ from defaults.
+function stripDefaults(value, defaults) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return JSON.stringify(value) === JSON.stringify(defaults) ? undefined : value;
+  }
+  if (!defaults || typeof defaults !== 'object' || Array.isArray(defaults)) return value;
+  const out = {};
+  let any = false;
+  for (const k of Object.keys(value)) {
+    const diff = stripDefaults(value[k], defaults[k]);
+    if (diff !== undefined) { out[k] = diff; any = true; }
+  }
+  return any ? out : undefined;
+}
+
+function allDefaults() {
+  return {
+    keybindings: DEFAULT_BINDINGS,
+    terminal: DEFAULT_TERMINAL,
+    window: DEFAULT_WINDOW,
+    panes: DEFAULT_PANES,
+    workspaces: DEFAULT_WORKSPACES,
+  };
+}
+
+function convertToConfig(world, paneId) {
+  const ws = activeWs(world);
+  if (!ws) return;
+  const pane = ws.panes.get(paneId);
+  if (!pane || pane.kind !== 'term') return;
+  try { pane.pty && pane.pty.kill(); } catch {}
+  if (world.rendererReady) {
+    world.termView.webContents.send('pane-change-kind', { paneId, kind: 'config' });
+  }
+  ws.panes.delete(paneId);
+
+  const view = new WebContentsView({
+    webPreferences: { nodeIntegration: true, contextIsolation: false, sandbox: false },
+  });
+  view.setBackgroundColor('#1a1a1a');
+  view.webContents.loadFile(CONFIG_UI_HTML);
+
+  const cp = { id: paneId, kind: 'config', view, rect: pane.rect };
+  ws.panes.set(paneId, cp);
+
+  view.webContents.on('before-input-event', (event, input) => {
+    const action = actionFor(input);
+    if (!action) return;
+    if (action === 'disengage' || action === 'closePane') {
+      event.preventDefault();
+      convertToTerminal(world, cp.id);
+    } else if (action === 'closeWindow') {
+      event.preventDefault();
+      if (!world.win.isDestroyed()) world.win.close();
+    } else if (action === 'newWindow') {
+      event.preventDefault();
+      newWindow();
+    }
+  });
+
+  world.win.contentView.addChildView(view);
+  layoutWorld(world);
+  try { view.webContents.focus(); } catch {}
+}
+
+function findConfigPaneByWc(wc) {
+  for (const world of worlds.values()) {
+    for (const ws of world.workspaces) {
+      for (const pane of ws.panes.values()) {
+        if (pane.kind === 'config' && pane.view.webContents === wc) {
+          return { world, ws, pane };
+        }
+      }
+    }
+  }
+  return null;
+}
+
+ipcMain.on('config-ui-ready', (e) => {
+  const found = findConfigPaneByWc(e.sender);
+  if (!found) return;
+  let current = {};
+  try { current = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')); } catch {}
+  found.pane.view.webContents.send('config-ui-init', {
+    current,
+    defaults: allDefaults(),
+  });
+});
+
+ipcMain.on('config-ui-save', (e, config) => {
+  const found = findConfigPaneByWc(e.sender);
+  if (!found) return;
+  const sectionDefaults = allDefaults();
+  const trimmed = {};
+  for (const [k, v] of Object.entries(config)) {
+    const diff = stripDefaults(v, sectionDefaults[k]);
+    if (diff !== undefined) trimmed[k] = diff;
+  }
+  const out = { _comment: 'Your overrides. Anything missing falls back to defaults.json (same dir).', ...trimmed };
+  try {
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(out, null, 2));
+    found.pane.view.webContents.send('config-ui-saved');
+    loadConfigFromDisk();
+  } catch (err) {
+    found.pane.view.webContents.send('config-ui-error', err.message);
+  }
+});
+
+ipcMain.on('config-ui-close', (e) => {
+  const found = findConfigPaneByWc(e.sender);
+  if (found) convertToTerminal(found.world, found.pane.id);
+});
+
+ipcMain.on('config-ui-reset', (e) => {
+  const found = findConfigPaneByWc(e.sender);
+  if (!found) return;
+  const stub = { _comment: 'Your overrides. Anything missing falls back to defaults.json (same dir).', keybindings: {} };
+  try {
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(stub, null, 2));
+    loadConfigFromDisk();
+    found.pane.view.webContents.send('config-ui-init', {
+      current: stub,
+      defaults: allDefaults(),
+    });
+  } catch (err) {
+    found.pane.view.webContents.send('config-ui-error', err.message);
+  }
 });
 
 app.on('window-all-closed', () => { app.quit(); });

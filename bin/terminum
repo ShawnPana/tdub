@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tdub — dispatcher for tdub subcommands.
+# terminum — dispatcher for terminum subcommands.
 set -e
 here="$(cd "$(dirname "$0")" && pwd)"
 cmd="${1:-help}"
@@ -14,17 +14,17 @@ case "$cmd" in
     ;;
   help|-h|--help|'')
     cat <<'USAGE'
-tdub — commands for the tdub terminal.
+terminum — commands for the terminum terminal.
 
-  tdub browse [url]   Turn the focused pane into a browser.
-  tdub config         Open ~/.config/tdub/config.json in $EDITOR.
+  terminum browse [url]   Turn the focused pane into a browser.
+  terminum config         Open ~/.config/terminum/config.json in $EDITOR.
 
 Shorthand: `browse` and `config` are aliases for the above.
 USAGE
     ;;
   *)
-    echo "tdub: unknown subcommand '$cmd'" >&2
-    echo "try: tdub help" >&2
+    echo "terminum: unknown subcommand '$cmd'" >&2
+    echo "try: terminum help" >&2
     exit 1
     ;;
 esac

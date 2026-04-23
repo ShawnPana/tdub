@@ -1,17 +1,11 @@
 #!/usr/bin/env bash
-# config — open tdub's config.json in $EDITOR. config.json holds your
-# personal overrides; defaults.json (same dir, regenerated every launch)
-# is the read-only reference with every setting and its default value.
-set -e
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/tdub"
-CONFIG_FILE="$CONFIG_DIR/config.json"
-mkdir -p "$CONFIG_DIR"
-if [ ! -f "$CONFIG_FILE" ]; then
-  cat > "$CONFIG_FILE" <<'JSON'
-{
-  "_comment": "Your overrides. Anything missing falls back to defaults.json (same dir). Reload on save.",
-  "keybindings": {}
-}
-JSON
+# config — ask terminum to open its settings window. Works inside tmux by
+# wrapping the OSC in DCS passthrough. Outside terminum this is a silent
+# no-op (the OSC is ignored).
+
+if [ -n "${TMUX:-}" ]; then
+  tmux set -g -q allow-passthrough on 2>/dev/null
+  printf '\ePtmux;\e\e]1983;terminum-config\e\e\\\e\\'
+else
+  printf '\e]1983;terminum-config\e\\'
 fi
-exec "${EDITOR:-vi}" "$CONFIG_FILE"

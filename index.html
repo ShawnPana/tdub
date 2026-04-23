@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>tdub</title>
+  <title>Terminum</title>
   <link rel="stylesheet" href="node_modules/@xterm/xterm/css/xterm.css">
   <style>
     :root {
@@ -10,6 +10,13 @@
       --pane-border-focused: #4a9eff;
       --pane-border-width: 1px;
       --bar-height: 22px;
+      --bar-font-size: 11px;
+      --ws-bg: #0b0b0b;
+      --ws-fg: #999999;
+      --ws-active-fg: #cd0000;
+      --ws-border-top: #1a1a1a;
+      --ws-hover-bg: #1a1a1a;
+      --ws-hover-fg: #dddddd;
     }
     html, body { margin: 0; padding: 0; height: 100%; background: #000; overflow: hidden; }
     body { -webkit-user-select: none; user-select: none; display: flex; flex-direction: column; }
@@ -20,22 +27,23 @@
       display: flex;
       align-items: center;
       padding: 0 6px;
-      background: #0b0b0b;
-      color: #999;
-      font: 11px ui-monospace, Menlo, monospace;
+      background: var(--ws-bg);
+      color: var(--ws-fg);
+      font-size: var(--bar-font-size);
+      font-family: ui-monospace, Menlo, monospace;
       overflow: hidden;
       gap: 4px;
-      border-top: 1px solid #1a1a1a;
+      border-top: 1px solid var(--ws-border-top);
     }
     .ws-tab {
       padding: 2px 8px;
       border-radius: 3px;
       cursor: pointer;
       white-space: nowrap;
-      color: #999;
+      color: var(--ws-fg);
     }
-    .ws-tab:hover { background: #1a1a1a; color: #ddd; }
-    .ws-tab.active { color: #cd0000; font-weight: bold; }
+    .ws-tab:hover { background: var(--ws-hover-bg); color: var(--ws-hover-fg); }
+    .ws-tab.active { color: var(--ws-active-fg); font-weight: bold; }
     .pane-host {
       position: absolute;
       overflow: hidden;

@@ -1,2 +1,2 @@
 [[ -f "$HOME/.zprofile" ]] && source "$HOME/.zprofile"
-[[ -n "$TDUB_BIN" ]] && export PATH="$TDUB_BIN:$PATH"
+[[ -n "$TERMINUM_BIN" ]] && export PATH="$TERMINUM_BIN:$PATH"

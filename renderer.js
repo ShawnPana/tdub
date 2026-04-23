@@ -64,11 +64,15 @@ function createTermPane(paneId) {
   term.open(host);
   term.onData((data) => ipcRenderer.send('pty-write', { paneId, data }));
 
-  // Per-term OSC 1983: browse fires in this pane; forward to main with pid/url.
+  // Per-term OSC 1983: browse / config / etc. fired from the pane's shell.
   term.parser.registerOscHandler(1983, (data) => {
     const semi = data.indexOf(';');
     const kind = semi === -1 ? data : data.slice(0, semi);
-    if (kind !== 'tdub-browse') return false;
+    if (kind === 'terminum-config') {
+      ipcRenderer.send('terminum-config');
+      return true;
+    }
+    if (kind !== 'terminum-browse') return false;
     const rest = data.slice(semi + 1);
     const params = {};
     let urlPart = '';
@@ -84,7 +88,7 @@ function createTermPane(paneId) {
       if (key === 'url') { urlPart = i === -1 ? val : val + ';' + remaining; break; }
       params[key] = val;
     }
-    ipcRenderer.send('tdub-browse', {
+    ipcRenderer.send('terminum-browse', {
       paneId,
       pid: String(params.pid || ''),
       url: urlPart || 'about:blank',
@@ -144,13 +148,13 @@ function setFocus(paneId) {
 }
 
 ipcRenderer.on('pane-add', (_e, { paneId, kind }) => {
-  if (kind === 'browser') createBrowserPaneHost(paneId);
+  if (kind === 'browser' || kind === 'config') createBrowserPaneHost(paneId);
   else createTermPane(paneId);
 });
 ipcRenderer.on('pane-remove', (_e, { paneId }) => destroyPane(paneId));
 ipcRenderer.on('pane-change-kind', (_e, { paneId, kind }) => {
   destroyPane(paneId);
-  if (kind === 'browser') createBrowserPaneHost(paneId);
+  if (kind === 'browser' || kind === 'config') createBrowserPaneHost(paneId);
   else createTermPane(paneId);
 });
 ipcRenderer.on('layout', (_e, { rectsByPaneId }) => applyLayout(rectsByPaneId));
@@ -195,6 +199,25 @@ function renderWorkspaces({ list, activeIdx }) {
 }
 ipcRenderer.on('workspaces', (_e, payload) => renderWorkspaces(payload));
 
+ipcRenderer.on('config-error', (_e, { message }) => {
+  let el = document.getElementById('config-error');
+  if (!message) {
+    if (el) el.remove();
+    return;
+  }
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'config-error';
+    el.style.marginLeft = 'auto';
+    el.style.color = '#cd0000';
+    el.style.fontWeight = 'bold';
+    el.title = message;
+    statusbar.appendChild(el);
+  }
+  el.textContent = `⚠ config error`;
+  el.title = message;
+});
+
 ipcRenderer.on('config-update', (_e, cfg) => {
   if (cfg.terminal) {
     termConfig = {
@@ -214,7 +237,27 @@ ipcRenderer.on('config-update', (_e, cfg) => {
     }
   }
   if (cfg.panes) applyPaneConfigToDOM(cfg.panes);
+  if (cfg.workspaces) {
+    const w = cfg.workspaces;
+    const root = document.documentElement;
+    if (w.background)       root.style.setProperty('--ws-bg', w.background);
+    if (w.foreground)       root.style.setProperty('--ws-fg', w.foreground);
+    if (w.activeForeground) root.style.setProperty('--ws-active-fg', w.activeForeground);
+    if (w.borderTop)        root.style.setProperty('--ws-border-top', w.borderTop);
+    if (w.hoverBackground)  root.style.setProperty('--ws-hover-bg', w.hoverBackground);
+    if (w.hoverForeground)  root.style.setProperty('--ws-hover-fg', w.hoverForeground);
+  }
   if (cfg.bindings) bindings = cfg.bindings;
+  // Bar height scales with zoom so the status bar grows/shrinks with the
+  // terminal font size. Bar font tracks the terminal font, minus a couple
+  // px so the tabs don't overwhelm the content.
+  if (cfg.barHeight) {
+    document.documentElement.style.setProperty('--bar-height', cfg.barHeight + 'px');
+  }
+  if (cfg.terminal && cfg.terminal.fontSize) {
+    const fs = Math.max(9, cfg.terminal.fontSize - 2);
+    document.documentElement.style.setProperty('--bar-font-size', fs + 'px');
+  }
 });
 
 // Chord dispatch (renderer). Needed because main's before-input-event doesn't

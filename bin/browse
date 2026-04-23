@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# browse — tell a tdub-aware terminal to flip the whole window into browser
-# mode. Works inside tmux by wrapping the OSC in tmux's DCS passthrough so
-# the sequence reaches the outer terminal unmodified. Non-tdub terminals
-# silently ignore the unknown OSC.
+# browse — tell a terminum-aware terminal to flip the focused pane into
+# browser mode. Works inside tmux by wrapping the OSC in tmux's DCS
+# passthrough so the sequence reaches the outer terminal unmodified.
+# Non-terminum terminals silently ignore the unknown OSC.
 URL="${1:-about:blank}"
 
 if [ -n "${TMUX:-}" ]; then
   tmux set -g -q allow-passthrough on 2>/dev/null
-  printf '\ePtmux;\e\e]1983;tdub-browse;pid=%s;url=%s\e\e\\\e\\' "$$" "$URL"
+  printf '\ePtmux;\e\e]1983;terminum-browse;pid=%s;url=%s\e\e\\\e\\' "$$" "$URL"
 else
-  printf '\e]1983;tdub-browse;pid=%s;url=%s\e\\' "$$" "$URL"
+  printf '\e]1983;terminum-browse;pid=%s;url=%s\e\\' "$$" "$URL"
 fi
 
-# Stay alive so tdub can reach back and SIGTERM us to return control to the
-# shell when the user exits the browser. Sleep is exec'd so there's nothing
-# to clean up.
+# Stay alive so terminum can reach back and SIGTERM us to return control
+# to the shell when the user exits the browser. Sleep is exec'd so there's
+# nothing to clean up.
 exec sleep 2147483647

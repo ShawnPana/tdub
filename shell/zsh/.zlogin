@@ -1,2 +1,2 @@
 [[ -f "$HOME/.zlogin" ]] && source "$HOME/.zlogin"
-[[ -n "$TDUB_BIN" ]] && export PATH="$TDUB_BIN:$PATH"
+[[ -n "$TERMINUM_BIN" ]] && export PATH="$TERMINUM_BIN:$PATH"

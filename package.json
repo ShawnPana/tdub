@@ -1,5 +1,5 @@
 {
-  "name": "tdub",
+  "name": "terminum",
   "version": "0.1.0",
   "description": "A terminal that can summon a browser.",
   "main": "main.js",
