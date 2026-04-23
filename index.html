@@ -5,14 +5,29 @@
   <title>tdub</title>
   <link rel="stylesheet" href="node_modules/@xterm/xterm/css/xterm.css">
   <style>
+    :root {
+      --pane-border-inactive: #2a2a2a;
+      --pane-border-focused: #4a9eff;
+      --pane-border-width: 1px;
+    }
     html, body { margin: 0; padding: 0; height: 100%; background: #000; overflow: hidden; }
     body { -webkit-user-select: none; user-select: none; }
-    #term { width: 100%; height: 100%; padding: 6px; box-sizing: border-box; }
-    .xterm { height: 100%; }
+    #stage { position: relative; width: 100%; height: 100%; }
+    .pane-host {
+      position: absolute;
+      overflow: hidden;
+      box-sizing: border-box;
+      background: #000;
+      border: var(--pane-border-width) solid var(--pane-border-inactive);
+      transition: border-color 80ms linear;
+    }
+    .pane-host.focused { border-color: var(--pane-border-focused); }
+    .pane-host.browser { background: transparent; }
+    .pane-host .xterm { height: 100%; padding: 2px; box-sizing: border-box; }
   </style>
 </head>
 <body>
-  <div id="term"></div>
+  <div id="stage"></div>
   <script src="renderer.js"></script>
 </body>
 </html>
