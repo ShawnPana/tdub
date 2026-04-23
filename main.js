@@ -2,33 +2,26 @@ const { app, BrowserWindow, WebContentsView, ipcMain } = require('electron');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
-const net = require('net');
 const pty = require('node-pty');
 
 const APP_DIR = __dirname;
 const BIN_DIR = path.join(APP_DIR, 'bin');
 const CHROME_HTML = path.join(APP_DIR, 'browser-chrome.html');
-const CHROME_BAR_HEIGHT = 28;             // collapsed navbar height
-const CHROME_EXPANDED_MAX = 320;           // cap for omnibox dropdown expansion
-// Stable per-user socket path at $HOME. Fixed path means tdub restarts don't
-// invalidate long-lived shells (e.g. tmux panes), and living in $HOME means
-// `browse` can compute the path from $HOME without depending on a TDUB_SOCK
-// env var that may or may not have propagated through tmux's env plumbing.
-const SOCKET_PATH = path.join(os.homedir(), '.tdub.sock');
+const CHROME_BAR_HEIGHT = 28;
+const CHROME_EXPANDED_MAX = 320;
 
 let win = null;
 let ptyProc = null;
-let browserView = null;     // page content
-let chromeView = null;      // navbar + omnibox
-let mode = 'terminal';
-let chromeExpandedHeight = 0;  // 0 = collapsed; >0 = dropdown open
+let cellMetrics = null;
+
+// pid (from the `browse` shell process) → overlay record.
+const overlays = new Map();
 
 function ptyEnv() {
   return {
     ...process.env,
     TERM: 'xterm-256color',
     PATH: `${BIN_DIR}:${process.env.PATH || ''}`,
-    TDUB_SOCK: SOCKET_PATH,
   };
 }
 
@@ -173,126 +166,132 @@ async function combinedSuggest(query) {
   return out;
 }
 
-// ---------- browser / navbar layout ----------
+// ---------- overlay layout ----------
 
-function layoutBrowser() {
+function cellRectToPixels(cellX, cellY, cols, rows) {
+  if (!cellMetrics || !win || win.isDestroyed()) return null;
+  const { cellWidth, cellHeight, origin, cols: totalCols, rows: totalRows } = cellMetrics;
+  const wb = win.getContentBounds();
+  let x1 = Math.round(origin.x + cellX * cellWidth);
+  let y1 = Math.round(origin.y + cellY * cellHeight);
+  let x2 = Math.round(origin.x + (cellX + cols) * cellWidth);
+  let y2 = Math.round(origin.y + (cellY + rows) * cellHeight);
+  // Snap edge-hugging overlays to the window's actual content bounds so we
+  // don't leave a few pixels of grid padding / sub-cell slack visible.
+  if (cellX <= 0) x1 = 0;
+  if (cellY <= 0) y1 = 0;
+  if (totalCols && cellX + cols >= totalCols) x2 = wb.width;
+  if (totalRows && cellY + rows >= totalRows) y2 = wb.height;
+  return { x: x1, y: y1, width: Math.max(0, x2 - x1), height: Math.max(0, y2 - y1) };
+}
+
+function layoutOverlays() {
   if (!win || win.isDestroyed()) return;
-  const b = win.getContentBounds();
-  if (chromeView) {
-    const desired = chromeExpandedHeight > CHROME_BAR_HEIGHT
-      ? Math.min(chromeExpandedHeight, CHROME_EXPANDED_MAX)
+  for (const overlay of overlays.values()) {
+    const rect = cellRectToPixels(overlay.cellX, overlay.cellY, overlay.cols, overlay.rows);
+    if (!rect) continue;
+    const desired = overlay.chromeExpandedHeight > CHROME_BAR_HEIGHT
+      ? Math.min(overlay.chromeExpandedHeight, CHROME_EXPANDED_MAX)
       : CHROME_BAR_HEIGHT;
-    const barH = Math.min(desired, b.height);
-    chromeView.setBounds({ x: 0, y: 0, width: b.width, height: barH });
-    if (browserView) {
-      browserView.setBounds({
-        x: 0, y: barH,
-        width: b.width,
-        height: Math.max(0, b.height - barH),
-      });
-    }
-  } else if (browserView) {
-    browserView.setBounds({ x: 0, y: 0, width: b.width, height: b.height });
+    const barH = Math.min(desired, rect.height);
+    overlay.chromeView.setBounds({
+      x: rect.x, y: rect.y, width: rect.width, height: barH,
+    });
+    overlay.view.setBounds({
+      x: rect.x, y: rect.y + barH,
+      width: rect.width,
+      height: Math.max(0, rect.height - barH),
+    });
   }
 }
 
-function pushChromeState() {
-  if (!chromeView || chromeView.webContents.isDestroyed()) return;
-  if (!browserView) return;
-  chromeView.webContents.send('nav-state', {
-    url: browserView.webContents.getURL() || '',
-    canGoBack: browserView.webContents.canGoBack(),
-    canGoForward: browserView.webContents.canGoForward(),
-  });
+function findOverlayByWc(wc) {
+  for (const overlay of overlays.values()) {
+    if (overlay.view.webContents === wc) return overlay;
+    if (overlay.chromeView.webContents === wc) return overlay;
+  }
+  return null;
 }
 
-function enterBrowser(url) {
+function createOverlay({ pid, cellX, cellY, cols, rows, url }) {
+  if (!pid || overlays.has(pid)) return;
   const target = normalizeUrl(url);
-  if (mode === 'browser' && browserView) {
-    browserView.webContents.loadURL(target);
-    return;
-  }
 
-  // Page content.
-  browserView = new WebContentsView({
+  const view = new WebContentsView({
     webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false },
   });
-  // Opaque background so the xterm underneath doesn't bleed through on
-  // about:blank (and during the brief load-time blank before a page paints).
-  browserView.setBackgroundColor('#ffffff');
-  browserView.webContents.on('before-input-event', (event, input) => {
-    if (input.type === 'keyDown' && input.key === 'Escape' && input.alt) {
-      event.preventDefault();
-      exitBrowser();
-    }
-  });
-  const onStateChange = () => {
-    pushChromeState();
-    try {
-      recordVisit(browserView.webContents.getURL(), browserView.webContents.getTitle());
-    } catch {}
-  };
-  browserView.webContents.on('did-navigate', onStateChange);
-  browserView.webContents.on('did-navigate-in-page', onStateChange);
-  browserView.webContents.on('did-finish-load', onStateChange);
-  browserView.webContents.on('page-title-updated', onStateChange);
+  // Opaque so the terminal underneath doesn't bleed through on about:blank or
+  // during load. Matches Chrome's new-tab white.
+  view.setBackgroundColor('#ffffff');
 
-  // Navbar — its own WebContentsView so it has nodeIntegration without
-  // taking it on the page.
-  chromeView = new WebContentsView({
+  const chromeView = new WebContentsView({
     webPreferences: { nodeIntegration: true, contextIsolation: false, sandbox: false },
   });
   chromeView.setBackgroundColor('#1b1b1b');
-  chromeView.webContents.loadFile(CHROME_HTML);
+  chromeView.webContents.loadFile(CHROME_HTML, { query: { id: pid } });
 
-  // Add content first, then chrome, so chrome is on top in z-order for the
-  // dropdown overlay.
-  win.contentView.addChildView(browserView);
+  const overlay = {
+    pid, cellX, cellY, cols, rows,
+    view, chromeView,
+    chromeExpandedHeight: 0,
+    url: target,
+  };
+  overlays.set(pid, overlay);
+
+  const pushNavState = () => {
+    if (chromeView.webContents.isDestroyed()) return;
+    chromeView.webContents.send('nav-state', {
+      url: view.webContents.getURL() || '',
+      canGoBack: view.webContents.canGoBack(),
+      canGoForward: view.webContents.canGoForward(),
+    });
+  };
+  overlay.pushNavState = pushNavState;
+
+  const onStateChange = () => {
+    pushNavState();
+    try { recordVisit(view.webContents.getURL(), view.webContents.getTitle()); } catch {}
+  };
+  view.webContents.on('did-navigate', onStateChange);
+  view.webContents.on('did-navigate-in-page', onStateChange);
+  view.webContents.on('did-finish-load', onStateChange);
+  view.webContents.on('page-title-updated', onStateChange);
+
+  // Option+Escape from anywhere inside the overlay dismisses it.
+  view.webContents.on('before-input-event', (event, input) => {
+    if (input.type === 'keyDown' && input.key === 'Escape' && input.alt) {
+      event.preventDefault();
+      destroyOverlay(pid);
+    }
+  });
+
+  // Content added first; chrome stacked on top so the omnibox dropdown can
+  // overlay content during an expanded state.
+  win.contentView.addChildView(view);
   win.contentView.addChildView(chromeView);
-
-  browserView.webContents.loadURL(target);
-  chromeExpandedHeight = 0;
-  layoutBrowser();
-  mode = 'browser';
-  killPty();
+  view.webContents.loadURL(target);
+  layoutOverlays();
 }
 
-function exitBrowser() {
-  if (chromeView) {
-    try { win.contentView.removeChildView(chromeView); } catch {}
-    try { chromeView.webContents.close(); } catch {}
-    chromeView = null;
+function destroyOverlay(pid) {
+  const overlay = overlays.get(pid);
+  if (!overlay) return;
+  overlays.delete(pid);
+  try { win.contentView.removeChildView(overlay.chromeView); } catch {}
+  try { overlay.chromeView.webContents.close(); } catch {}
+  try { win.contentView.removeChildView(overlay.view); } catch {}
+  try { overlay.view.webContents.close(); } catch {}
+  // Tear down the `browse` shell process so the pane (or bare terminal) is
+  // released. Its cleanup trap will emit tdub-browse-end, which we handle
+  // idempotently (overlay already gone).
+  const n = Number(pid);
+  if (Number.isFinite(n)) {
+    try { process.kill(n, 'SIGTERM'); } catch {}
   }
-  if (browserView) {
-    try { win.contentView.removeChildView(browserView); } catch {}
-    try { browserView.webContents.close(); } catch {}
-    browserView = null;
-  }
-  chromeExpandedHeight = 0;
-  mode = 'terminal';
-  spawnPty();
+  // Refocus the main renderer so the terminal regains keyboard.
   if (win && !win.isDestroyed()) {
-    try { win.webContents.send('reset'); } catch {}
     try { win.webContents.focus(); } catch {}
   }
-}
-
-function startSocketServer() {
-  try { fs.unlinkSync(SOCKET_PATH); } catch {}
-  const server = net.createServer((conn) => {
-    let buf = '';
-    conn.on('data', (chunk) => {
-      buf += chunk.toString();
-      const lines = buf.split('\n');
-      buf = lines.pop();
-      for (const line of lines) {
-        const m = line.match(/^browse\s+(.+)$/);
-        if (m) enterBrowser(m[1].trim());
-      }
-    });
-  });
-  server.listen(SOCKET_PATH);
-  return server;
 }
 
 function createWindow() {
@@ -306,8 +305,7 @@ function createWindow() {
     },
   });
   win.loadFile('index.html');
-
-  win.on('resize', layoutBrowser);
+  win.on('resize', layoutOverlays);
   win.on('closed', () => {
     killPty();
     win = null;
@@ -316,7 +314,6 @@ function createWindow() {
 
 // ---------- IPC ----------
 
-// PTY
 ipcMain.on('renderer-ready', (_e, { cols, rows }) => {
   if (!ptyProc) spawnPty(cols || 100, rows || 30);
 });
@@ -326,51 +323,63 @@ ipcMain.on('pty-resize', (_e, { cols, rows }) => {
     try { ptyProc.resize(cols, rows); } catch {}
   }
 });
+ipcMain.on('cell-metrics', (_e, metrics) => {
+  cellMetrics = metrics;
+  layoutOverlays();
+});
 
-// Navbar
-ipcMain.on('chrome-ready', () => {
-  pushChromeState();
-  // Chrome-style new-tab behavior: on about:blank, focus the URL input so
-  // the user can type a URL immediately without clicking.
-  if (browserView && chromeView && !chromeView.webContents.isDestroyed()) {
-    const u = browserView.webContents.getURL() || '';
-    if (/^about:blank\b/.test(u)) {
-      try { chromeView.webContents.focus(); } catch {}
-      try { chromeView.webContents.send('focus-url'); } catch {}
-    }
+// OSC-driven overlay lifecycle.
+ipcMain.on('tdub-browse', (_e, params) => createOverlay(params));
+ipcMain.on('tdub-browse-end', (_e, { pid }) => destroyOverlay(pid));
+
+// Per-overlay navbar IPCs. The overlay id is the same `pid` the OSC used.
+ipcMain.on('chrome-ready', (_e, id) => {
+  const overlay = overlays.get(id);
+  if (!overlay) return;
+  overlay.pushNavState();
+  // Chrome-new-tab behavior: auto-focus URL input on about:blank.
+  const u = overlay.view.webContents.getURL() || '';
+  if (/^about:blank\b/.test(u)) {
+    try { overlay.chromeView.webContents.focus(); } catch {}
+    try { overlay.chromeView.webContents.send('focus-url'); } catch {}
   }
 });
-ipcMain.on('chrome-click', () => { /* no-op in tdub */ });
-ipcMain.on('chrome-defocus', () => exitBrowser());
-ipcMain.on('chrome-expand', (_e, height) => {
-  chromeExpandedHeight = (height && height > CHROME_BAR_HEIGHT) ? height : 0;
-  layoutBrowser();
+ipcMain.on('chrome-click', () => { /* no-op */ });
+ipcMain.on('chrome-defocus', (_e, id) => destroyOverlay(id));
+ipcMain.on('chrome-expand', (_e, id, height) => {
+  const overlay = overlays.get(id);
+  if (!overlay) return;
+  overlay.chromeExpandedHeight = (height && height > CHROME_BAR_HEIGHT) ? height : 0;
+  layoutOverlays();
 });
-ipcMain.on('nav-back', () => {
-  if (browserView && browserView.webContents.canGoBack()) browserView.webContents.goBack();
+ipcMain.on('nav-back', (_e, id) => {
+  const overlay = overlays.get(id);
+  if (overlay && overlay.view.webContents.canGoBack()) overlay.view.webContents.goBack();
 });
-ipcMain.on('nav-forward', () => {
-  if (browserView && browserView.webContents.canGoForward()) browserView.webContents.goForward();
+ipcMain.on('nav-forward', (_e, id) => {
+  const overlay = overlays.get(id);
+  if (overlay && overlay.view.webContents.canGoForward()) overlay.view.webContents.goForward();
 });
-ipcMain.on('nav-reload', () => {
-  if (browserView) browserView.webContents.reload();
+ipcMain.on('nav-reload', (_e, id) => {
+  const overlay = overlays.get(id);
+  if (overlay) overlay.view.webContents.reload();
 });
-ipcMain.on('nav-url', (_e, raw) => {
-  if (!browserView) return;
+ipcMain.on('nav-url', (_e, id, raw) => {
+  const overlay = overlays.get(id);
+  if (!overlay) return;
   const target = normalizeUrl(raw);
   if (!target) return;
-  try { browserView.webContents.loadURL(target); } catch {}
-  try { browserView.webContents.focus(); } catch {}
+  try { overlay.view.webContents.loadURL(target); } catch {}
+  try { overlay.view.webContents.focus(); } catch {}
 });
 ipcMain.handle('omnibox-suggest', (_e, query) => combinedSuggest(query || ''));
 
 app.whenReady().then(() => {
   loadHistory();
-  startSocketServer();
   createWindow();
 });
 
 app.on('window-all-closed', () => {
-  try { fs.unlinkSync(SOCKET_PATH); } catch {}
+  // Any still-alive `browse` processes will exit when their ptys close.
   app.quit();
 });
