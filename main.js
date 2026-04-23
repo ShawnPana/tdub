@@ -5,6 +5,37 @@ const os = require('os');
 const fs = require('fs');
 const pty = require('node-pty');
 
+// Stealth: mirror ophanim-browser's switches. Cloudflare and Kasada-style
+// bot walls scan for these signals.
+//   - `AutomationControlled` Blink feature sets navigator.webdriver = true
+//     and adds related automation signals; disable it.
+//   - Strip "tdub/x.y.z" and "Electron/x.y.z" from the default user agent
+//     so pages see a plain Chrome UA, not an Electron-branded one.
+//   - Enable Chromium's remote-debugging so CDP is available at runtime
+//     (0 = auto-select port); allow any origin since we gate externally.
+app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled');
+app.commandLine.appendSwitch('remote-debugging-port', '0');
+app.commandLine.appendSwitch('remote-debugging-address', '127.0.0.1');
+app.commandLine.appendSwitch('remote-allow-origins', '*');
+app.userAgentFallback = (app.userAgentFallback || '')
+  .replace(/\s?tdub\/\S+/, '')
+  .replace(/\s?Electron\/\S+/, '');
+
+// Boot-time config read: certain settings (like userData path) must be
+// applied before app.whenReady(). Everything else is still loaded lazily
+// via loadConfigFromDisk in whenReady().
+(function applyBootConfig() {
+  try {
+    const bootCfgPath = path.join(os.homedir(), '.config', 'tdub', 'config.json');
+    const raw = fs.readFileSync(bootCfgPath, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed.profileDir === 'string' && parsed.profileDir.trim()) {
+      const dir = parsed.profileDir.trim().replace(/^~(?=\/|$)/, os.homedir());
+      try { app.setPath('userData', dir); } catch (e) { console.warn('[tdub] profileDir:', e.message); }
+    }
+  } catch {}
+})();
+
 const APP_DIR = __dirname;
 const BIN_DIR = path.join(APP_DIR, 'bin');
 const CHROME_HTML = path.join(APP_DIR, 'browser-chrome.html');
