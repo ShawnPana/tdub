@@ -159,6 +159,41 @@ ipcRenderer.on('pty-data', (_e, { paneId, data }) => {
   const entry = panes.get(paneId);
   if (entry && entry.term) entry.term.write(data);
 });
+ipcRenderer.on('pane-visibility', (_e, { visible, hidden }) => {
+  for (const paneId of hidden || []) {
+    const entry = panes.get(paneId);
+    if (entry) entry.host.style.display = 'none';
+  }
+  for (const paneId of visible || []) {
+    const entry = panes.get(paneId);
+    if (entry) {
+      entry.host.style.display = '';
+      if (entry.fit) { try { entry.fit.fit(); } catch {} }
+    }
+  }
+});
+
+// ---------- workspace bar ----------
+const statusbar = document.getElementById('statusbar');
+function renderWorkspaces({ list, activeIdx }) {
+  statusbar.innerHTML = '';
+  list.forEach((ws, i) => {
+    const el = document.createElement('div');
+    el.className = 'ws-tab' + (i === activeIdx ? ' active' : '');
+    el.textContent = `${i + 1}:${ws.name}`;
+    el.title = ws.name;
+    el.addEventListener('click', () => ipcRenderer.send('activate-workspace', { idx: i }));
+    el.addEventListener('dblclick', (ev) => {
+      ev.preventDefault();
+      const next = prompt('Rename workspace', ws.name);
+      if (next && next.trim()) {
+        ipcRenderer.send('rename-workspace', { idx: i, name: next.trim() });
+      }
+    });
+    statusbar.appendChild(el);
+  });
+}
+ipcRenderer.on('workspaces', (_e, payload) => renderWorkspaces(payload));
 
 ipcRenderer.on('config-update', (_e, cfg) => {
   if (cfg.terminal) {

@@ -9,25 +9,35 @@ const APP_DIR = __dirname;
 const BIN_DIR = path.join(APP_DIR, 'bin');
 const CHROME_HTML = path.join(APP_DIR, 'browser-chrome.html');
 const CHROME_BAR_HEIGHT = 28;
+const WORKSPACE_BAR_HEIGHT = 22;
 
 const CONFIG_DIR = path.join(os.homedir(), '.config', 'tdub');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
 
 const DEFAULT_BINDINGS = {
-  newTerminal:      ['Cmd+T'],
-  closePane:        ['Cmd+W'],
-  closeWindow:      ['Cmd+Shift+W'],
-  newWindow:        ['Cmd+N'],
+  // Pane ops
+  newTerminal:      ['Alt+N'],
+  closePane:        ['Alt+W'],
   splitRight:       ['Cmd+Alt+N'],
   splitDown:        ['Cmd+Alt+Shift+N'],
   navLeft:          ['Cmd+H'],
   navDown:          ['Cmd+J'],
   navUp:            ['Cmd+K'],
   navRight:         ['Cmd+L'],
+  equalize:         ['Cmd+Alt+='],
+  // Workspace ops (named "windows" in tmux/smux terms — a tab of panes)
+  newWorkspace:     ['Cmd+T'],
+  closeWorkspace:   ['Cmd+W'],
+  nextWorkspace:    ['Cmd+Shift+]'],
+  prevWorkspace:    ['Cmd+Shift+['],
+  // Electron window ops
+  newWindow:        ['Cmd+Shift+N'],
+  closeWindow:      ['Cmd+Shift+W'],
+  // Zoom
   zoomIn:           ['Cmd+='],
   zoomOut:          ['Cmd+-'],
   zoomReset:        ['Cmd+0'],
-  equalize:         ['Cmd+Alt+='],
+  // Browser engage
   engage:           ['Cmd+Enter'],
   disengage:        ['Alt+Escape'],
 };
@@ -139,6 +149,7 @@ function pushRuntimeConfig(world) {
     terminal: { ...termConfig, fontSize: effectiveFontSize },
     panes: paneConfig,
     bindings,
+    barHeight: WORKSPACE_BAR_HEIGHT,
   });
 }
 
@@ -166,10 +177,31 @@ function watchConfig() {
   } catch (e) { console.warn('[tdub] watchConfig:', e.message); }
 }
 
+// ---------- state ----------
+//
+// World = one Electron BrowserWindow.
+//   { win, termView, workspaces, activeIdx, rendererReady, zoomDelta, pollId }
+// Workspace = a tmux-style "window" — named split tree of panes.
+//   { id, name, root, focusedPaneId, panes: Map<paneId, Pane> }
+// Pane = { id, kind: 'term'|'browser', ... }
 const worlds = new Map();
 
 let nextPaneSeq = 1;
+let nextWsSeq = 1;
 const newPaneId = () => `p${nextPaneSeq++}`;
+const newWsId   = () => `w${nextWsSeq++}`;
+
+const activeWs = (world) => world.workspaces[world.activeIdx];
+
+function findPaneGlobal(paneId) {
+  for (const world of worlds.values()) {
+    for (const ws of world.workspaces) {
+      const p = ws.panes.get(paneId);
+      if (p) return { world, ws, pane: p };
+    }
+  }
+  return null;
+}
 
 function ptyEnv() {
   return {
@@ -196,8 +228,8 @@ function spawnPty(world, paneId, cols = 100, rows = 30) {
   });
   p.onExit(() => {
     if (!worlds.has(world.win.id)) return;
-    const cur = world.panes.get(paneId);
-    if (!cur || cur.kind !== 'term' || cur.pty !== p) return;
+    const found = findPaneGlobal(paneId);
+    if (!found || found.pane.kind !== 'term' || found.pane.pty !== p) return;
     closePane(world, paneId);
   });
   return p;
@@ -319,11 +351,11 @@ async function combinedSuggest(query) {
   return out;
 }
 
-// ---------- tree ----------
+// ---------- tree + layout ----------
 
 function contentRect(world) {
   const wb = world.win.getContentBounds();
-  return { x: 0, y: 0, w: wb.width, h: wb.height };
+  return { x: 0, y: 0, w: wb.width, h: Math.max(0, wb.height - WORKSPACE_BAR_HEIGHT) };
 }
 
 function layoutNode(node, rect, out) {
@@ -341,11 +373,13 @@ function layoutNode(node, rect, out) {
 
 function layoutWorld(world) {
   if (world.win.isDestroyed()) return;
+  const ws = activeWs(world);
+  if (!ws) return;
   const rect = contentRect(world);
   const rects = {};
-  layoutNode(world.root, rect, rects);
+  layoutNode(ws.root, rect, rects);
   for (const [paneId, r] of Object.entries(rects)) {
-    const pane = world.panes.get(paneId);
+    const pane = ws.panes.get(paneId);
     if (!pane) continue;
     pane.rect = r;
     if (pane.kind === 'browser') {
@@ -354,10 +388,30 @@ function layoutWorld(world) {
       const barH = Math.min(CHROME_BAR_HEIGHT, ih);
       try { pane.chromeView.setBounds({ x: ix, y: iy, width: iw, height: barH }); } catch {}
       try { pane.view.setBounds({ x: ix, y: iy + barH, width: iw, height: Math.max(0, ih - barH) }); } catch {}
+      try { pane.view.setVisible(true); } catch {}
+      try { pane.chromeView.setVisible(true); } catch {}
+    }
+  }
+  // Hide browser panes of inactive workspaces.
+  for (const otherWs of world.workspaces) {
+    if (otherWs === ws) continue;
+    for (const p of otherWs.panes.values()) {
+      if (p.kind === 'browser') {
+        try { p.view.setVisible(false); } catch {}
+        try { p.chromeView.setVisible(false); } catch {}
+      }
     }
   }
   if (world.rendererReady) {
     world.termView.webContents.send('layout', { rectsByPaneId: rects });
+    // Tell renderer which terminal panes to show/hide.
+    const visiblePaneIds = Object.keys(rects);
+    const hiddenPaneIds = [];
+    for (const otherWs of world.workspaces) {
+      if (otherWs === ws) continue;
+      for (const p of otherWs.panes.values()) hiddenPaneIds.push(p.id);
+    }
+    world.termView.webContents.send('pane-visibility', { visible: visiblePaneIds, hidden: hiddenPaneIds });
   }
 }
 
@@ -366,9 +420,9 @@ function findLeafParent(node, paneId, parent = null) {
   return findLeafParent(node.a, paneId, node) || findLeafParent(node.b, paneId, node);
 }
 
-function addTermPane(world, paneId) {
+function addTermPane(world, ws, paneId) {
   const pane = { id: paneId, kind: 'term', pty: null, rect: { x: 0, y: 0, w: 1, h: 1 } };
-  world.panes.set(paneId, pane);
+  ws.panes.set(paneId, pane);
   if (world.rendererReady) {
     world.termView.webContents.send('pane-add', { paneId, kind: 'term' });
   }
@@ -376,25 +430,19 @@ function addTermPane(world, paneId) {
   return pane;
 }
 
-function removePane(world, paneId) {
-  const pane = world.panes.get(paneId);
-  if (!pane) return;
-  world.panes.delete(paneId);
+function destroyPaneResources(world, pane) {
   if (pane.kind === 'term') {
     try { pane.pty && pane.pty.kill(); } catch {}
-    if (world.rendererReady) {
-      world.termView.webContents.send('pane-remove', { paneId });
-    }
   } else if (pane.kind === 'browser') {
     try { world.win.contentView.removeChildView(pane.chromeView); } catch {}
     try { pane.chromeView.webContents.close(); } catch {}
     try { world.win.contentView.removeChildView(pane.view); } catch {}
     try { pane.view.webContents.close(); } catch {}
-    if (world.rendererReady) {
-      world.termView.webContents.send('pane-remove', { paneId });
-    }
     const n = Number(pane.pid || '');
     if (Number.isFinite(n)) { try { process.kill(n, 'SIGTERM'); } catch {} }
+  }
+  if (world.rendererReady) {
+    world.termView.webContents.send('pane-remove', { paneId: pane.id });
   }
 }
 
@@ -403,43 +451,48 @@ function smartDirection(rect) {
 }
 
 function split(world, paneId, dir) {
-  const found = findLeafParent(world.root, paneId);
+  const ws = activeWs(world);
+  if (!ws) return;
+  const found = findLeafParent(ws.root, paneId);
   if (!found) return;
   const { leaf, parent } = found;
   const newId = newPaneId();
-  addTermPane(world, newId);
+  addTermPane(world, ws, newId);
   const splitNode = { kind: 'split', dir, ratio: 0.5, a: leaf, b: { kind: 'leaf', paneId: newId } };
-  if (!parent) world.root = splitNode;
+  if (!parent) ws.root = splitNode;
   else if (parent.a === leaf) parent.a = splitNode;
   else parent.b = splitNode;
-  world.focusedPaneId = newId;
+  ws.focusedPaneId = newId;
   layoutWorld(world);
   pushFocus(world);
 }
 
 function closePane(world, paneId) {
-  if (!world.panes.has(paneId)) return;
-  if (world.root.kind === 'leaf' && world.root.paneId === paneId) return;
-  removePane(world, paneId);
+  const ws = activeWs(world);
+  if (!ws || !ws.panes.has(paneId)) return;
+  if (ws.root.kind === 'leaf' && ws.root.paneId === paneId) return;
+  const pane = ws.panes.get(paneId);
+  ws.panes.delete(paneId);
+  destroyPaneResources(world, pane);
   const unlink = (node, pp = null) => {
     if (node.kind === 'leaf') return false;
     if (node.a.kind === 'leaf' && node.a.paneId === paneId) {
-      replaceNode(pp, node, node.b, world); return true;
+      replaceNode(pp, node, node.b, ws); return true;
     }
     if (node.b.kind === 'leaf' && node.b.paneId === paneId) {
-      replaceNode(pp, node, node.a, world); return true;
+      replaceNode(pp, node, node.a, ws); return true;
     }
     return unlink(node.a, node) || unlink(node.b, node);
   };
-  unlink(world.root);
-  const anyLeaf = firstLeaf(world.root);
-  if (anyLeaf) world.focusedPaneId = anyLeaf.paneId;
+  unlink(ws.root);
+  const anyLeaf = firstLeaf(ws.root);
+  if (anyLeaf) ws.focusedPaneId = anyLeaf.paneId;
   layoutWorld(world);
   pushFocus(world);
 }
 
-function replaceNode(parent, oldNode, newNode, world) {
-  if (!parent) world.root = newNode;
+function replaceNode(parent, oldNode, newNode, ws) {
+  if (!parent) ws.root = newNode;
   else if (parent.a === oldNode) parent.a = newNode;
   else if (parent.b === oldNode) parent.b = newNode;
 }
@@ -458,9 +511,11 @@ function allLeaves(node, out = []) {
 }
 
 function gotoDir(world, dir) {
-  const cur = world.panes.get(world.focusedPaneId);
+  const ws = activeWs(world);
+  if (!ws) return;
+  const cur = ws.panes.get(ws.focusedPaneId);
   if (!cur) return;
-  const leaves = allLeaves(world.root).map((l) => world.panes.get(l.paneId)).filter(Boolean);
+  const leaves = allLeaves(ws.root).map((l) => ws.panes.get(l.paneId)).filter(Boolean);
   const cr = cur.rect;
   const cmid = { x: cr.x + cr.w / 2, y: cr.y + cr.h / 2 };
   let best = null, bestScore = Infinity;
@@ -479,13 +534,15 @@ function gotoDir(world, dir) {
     const score = dist + perp;
     if (score < bestScore) { bestScore = score; best = p; }
   }
-  if (best) { world.focusedPaneId = best.id; pushFocus(world); }
+  if (best) { ws.focusedPaneId = best.id; pushFocus(world); }
 }
 
 function pushFocus(world) {
   if (!world.rendererReady || world.win.isDestroyed()) return;
-  world.termView.webContents.send('focus', { paneId: world.focusedPaneId });
-  const pane = world.panes.get(world.focusedPaneId);
+  const ws = activeWs(world);
+  if (!ws) return;
+  world.termView.webContents.send('focus', { paneId: ws.focusedPaneId });
+  const pane = ws.panes.get(ws.focusedPaneId);
   if (pane && pane.kind === 'browser' && pane.engaged) {
     try { pane.view.webContents.focus(); } catch {}
   } else {
@@ -505,11 +562,10 @@ function updateBrowserBorder(pane) {
   } catch {}
 }
 
-// Zoom: terminal panes scale xterm font size (affects all terminals in the
-// window); browser panes scale the page via webContents.setZoomFactor.
-// `step` is +1 / -1 (in/out) or 0 (reset).
 function applyZoom(world, step) {
-  const pane = world.panes.get(world.focusedPaneId);
+  const ws = activeWs(world);
+  if (!ws) return;
+  const pane = ws.panes.get(ws.focusedPaneId);
   if (pane && pane.kind === 'browser') {
     try {
       if (step === 0) pane.view.webContents.setZoomFactor(1);
@@ -526,17 +582,73 @@ function applyZoom(world, step) {
   pushRuntimeConfig(world);
 }
 
+// ---------- workspaces ----------
+
+function pushWorkspaces(world) {
+  if (!world.rendererReady || world.win.isDestroyed()) return;
+  world.termView.webContents.send('workspaces', {
+    list: world.workspaces.map((w) => ({ id: w.id, name: w.name })),
+    activeIdx: world.activeIdx,
+  });
+}
+
+function newWorkspace(world, name) {
+  const ws = {
+    id: newWsId(),
+    name: name || `ws${world.workspaces.length + 1}`,
+    root: null,
+    focusedPaneId: null,
+    panes: new Map(),
+  };
+  const paneId = newPaneId();
+  ws.root = { kind: 'leaf', paneId };
+  ws.focusedPaneId = paneId;
+  world.workspaces.push(ws);
+  addTermPane(world, ws, paneId);
+  activateWorkspace(world, world.workspaces.length - 1);
+}
+
+function closeWorkspace(world, idx) {
+  const ws = world.workspaces[idx];
+  if (!ws) return;
+  for (const p of ws.panes.values()) destroyPaneResources(world, p);
+  world.workspaces.splice(idx, 1);
+  if (world.workspaces.length === 0) {
+    if (!world.win.isDestroyed()) world.win.close();
+    return;
+  }
+  const newActive = Math.min(idx, world.workspaces.length - 1);
+  activateWorkspace(world, newActive);
+}
+
+function activateWorkspace(world, idx) {
+  if (idx < 0 || idx >= world.workspaces.length) return;
+  world.activeIdx = idx;
+  layoutWorld(world);
+  pushFocus(world);
+  pushWorkspaces(world);
+}
+
+function cycleWorkspace(world, dir) {
+  if (world.workspaces.length <= 1) return;
+  const n = world.workspaces.length;
+  const idx = (world.activeIdx + dir + n) % n;
+  activateWorkspace(world, idx);
+}
+
 // ---------- browser pane conversion ----------
 
 function convertToBrowser(world, paneId, url, pid) {
-  const pane = world.panes.get(paneId);
+  const ws = activeWs(world);
+  if (!ws) return;
+  const pane = ws.panes.get(paneId);
   if (!pane || pane.kind !== 'term') return;
   const target = normalizeUrl(url);
   try { pane.pty && pane.pty.kill(); } catch {}
   if (world.rendererReady) {
     world.termView.webContents.send('pane-change-kind', { paneId, kind: 'browser' });
   }
-  world.panes.delete(paneId);
+  ws.panes.delete(paneId);
 
   const view = new WebContentsView({
     webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false },
@@ -553,7 +665,7 @@ function convertToBrowser(world, paneId, url, pid) {
     rect: pane.rect, engaged: false,
     pid: String(pid || ''),
   };
-  world.panes.set(paneId, bp);
+  ws.panes.set(paneId, bp);
 
   const pushNavState = () => {
     if (chromeView.webContents.isDestroyed()) return;
@@ -587,7 +699,9 @@ function convertToBrowser(world, paneId, url, pid) {
 }
 
 function convertToTerminal(world, paneId) {
-  const pane = world.panes.get(paneId);
+  const ws = activeWs(world);
+  if (!ws) return;
+  const pane = ws.panes.get(paneId);
   if (!pane || pane.kind !== 'browser') return;
   try { world.win.contentView.removeChildView(pane.chromeView); } catch {}
   try { pane.chromeView.webContents.close(); } catch {}
@@ -597,7 +711,7 @@ function convertToTerminal(world, paneId) {
   if (Number.isFinite(n)) { try { process.kill(n, 'SIGTERM'); } catch {} }
 
   const termPane = { id: paneId, kind: 'term', pty: null, rect: pane.rect };
-  world.panes.set(paneId, termPane);
+  ws.panes.set(paneId, termPane);
   if (world.rendererReady) {
     world.termView.webContents.send('pane-change-kind', { paneId, kind: 'term' });
   }
@@ -609,40 +723,45 @@ function convertToTerminal(world, paneId) {
 function handleBrowserPaneInput(world, pane, event, input) {
   const action = actionFor(input);
   if (!action) return false;
-  // Cmd+L while engaged: focus URL bar.
   if (action === 'navRight' && pane.engaged && input.meta && !input.alt) {
     try { pane.chromeView.webContents.focus(); } catch {}
     try { pane.chromeView.webContents.send('focus-url'); } catch {}
     return true;
   }
-  // Everything else: delegate to main dispatcher.
   return dispatchAction(world, action);
 }
 
 // ---------- keybinding dispatch ----------
 
 function dispatchAction(world, action) {
+  const ws = activeWs(world);
   switch (action) {
     case 'newTerminal': {
-      const p = world.panes.get(world.focusedPaneId);
+      if (!ws) return true;
+      const p = ws.panes.get(ws.focusedPaneId);
       if (p) split(world, p.id, smartDirection(p.rect));
       return true;
     }
-    case 'closePane':   closePane(world, world.focusedPaneId); return true;
-    case 'closeWindow': if (!world.win.isDestroyed()) world.win.close(); return true;
-    case 'newWindow':   newWindow(); return true;
-    case 'splitRight':  split(world, world.focusedPaneId, 'h'); return true;
-    case 'splitDown':   split(world, world.focusedPaneId, 'v'); return true;
-    case 'navLeft':     gotoDir(world, 'left'); return true;
-    case 'navDown':     gotoDir(world, 'down'); return true;
-    case 'navUp':       gotoDir(world, 'up'); return true;
-    case 'navRight':    gotoDir(world, 'right'); return true;
-    case 'equalize':    equalize(world.root); layoutWorld(world); return true;
-    case 'zoomIn':      applyZoom(world, +1); return true;
-    case 'zoomOut':     applyZoom(world, -1); return true;
-    case 'zoomReset':   applyZoom(world, 0); return true;
+    case 'closePane':   if (ws) closePane(world, ws.focusedPaneId); return true;
+    case 'newWorkspace':   newWorkspace(world); return true;
+    case 'closeWorkspace': closeWorkspace(world, world.activeIdx); return true;
+    case 'nextWorkspace':  cycleWorkspace(world, +1); return true;
+    case 'prevWorkspace':  cycleWorkspace(world, -1); return true;
+    case 'closeWindow':    if (!world.win.isDestroyed()) world.win.close(); return true;
+    case 'newWindow':      newWindow(); return true;
+    case 'splitRight':     if (ws) split(world, ws.focusedPaneId, 'h'); return true;
+    case 'splitDown':      if (ws) split(world, ws.focusedPaneId, 'v'); return true;
+    case 'navLeft':        gotoDir(world, 'left'); return true;
+    case 'navDown':        gotoDir(world, 'down'); return true;
+    case 'navUp':          gotoDir(world, 'up'); return true;
+    case 'navRight':       gotoDir(world, 'right'); return true;
+    case 'equalize':       if (ws) { equalize(ws.root); layoutWorld(world); } return true;
+    case 'zoomIn':         applyZoom(world, +1); return true;
+    case 'zoomOut':        applyZoom(world, -1); return true;
+    case 'zoomReset':      applyZoom(world, 0); return true;
     case 'engage': {
-      const p = world.panes.get(world.focusedPaneId);
+      if (!ws) return true;
+      const p = ws.panes.get(ws.focusedPaneId);
       if (p && p.kind === 'browser') {
         p.engaged = true;
         try { p.view.webContents.focus(); } catch {}
@@ -651,7 +770,8 @@ function dispatchAction(world, action) {
       return true;
     }
     case 'disengage': {
-      const p = world.panes.get(world.focusedPaneId);
+      if (!ws) return true;
+      const p = ws.panes.get(ws.focusedPaneId);
       if (p && p.kind === 'browser') {
         if (p.engaged) {
           p.engaged = false;
@@ -696,15 +816,24 @@ function newWindow() {
 
   const world = {
     win, termView,
-    root: null, focusedPaneId: null, panes: new Map(),
+    workspaces: [], activeIdx: 0,
     rendererReady: false, zoomDelta: 0,
   };
   worlds.set(win.id, world);
 
+  // Seed with one workspace containing one terminal pane.
+  const ws0 = {
+    id: newWsId(),
+    name: 'ws1',
+    root: null,
+    focusedPaneId: null,
+    panes: new Map(),
+  };
   const paneId = newPaneId();
-  world.root = { kind: 'leaf', paneId };
-  world.focusedPaneId = paneId;
-  addTermPane(world, paneId);
+  ws0.root = { kind: 'leaf', paneId };
+  ws0.focusedPaneId = paneId;
+  world.workspaces.push(ws0);
+  addTermPane(world, ws0, paneId);
 
   termView.webContents.on('before-input-event', (event, input) => {
     if (handleNavChord(world, input)) event.preventDefault();
@@ -725,11 +854,13 @@ function newWindow() {
   const pollId = setInterval(syncTermBounds, 250);
   win.on('closed', () => {
     clearInterval(pollId);
-    for (const pane of world.panes.values()) {
-      if (pane.kind === 'term') { try { pane.pty && pane.pty.kill(); } catch {} }
-      if (pane.kind === 'browser') {
-        const n = Number(pane.pid || '');
-        if (Number.isFinite(n)) { try { process.kill(n, 'SIGTERM'); } catch {} }
+    for (const ws of world.workspaces) {
+      for (const p of ws.panes.values()) {
+        if (p.kind === 'term') { try { p.pty && p.pty.kill(); } catch {} }
+        if (p.kind === 'browser') {
+          const n = Number(p.pid || '');
+          if (Number.isFinite(n)) { try { process.kill(n, 'SIGTERM'); } catch {} }
+        }
       }
     }
     worlds.delete(win.id);
@@ -745,29 +876,32 @@ ipcMain.on('renderer-ready', (e) => {
     if (world.termView.webContents === e.sender) {
       world.rendererReady = true;
       pushRuntimeConfig(world);
-      for (const pane of world.panes.values()) {
-        if (pane.kind === 'term') {
-          world.termView.webContents.send('pane-add', { paneId: pane.id, kind: 'term' });
+      for (const ws of world.workspaces) {
+        for (const pane of ws.panes.values()) {
+          if (pane.kind === 'term') {
+            world.termView.webContents.send('pane-add', { paneId: pane.id, kind: 'term' });
+          }
         }
       }
       layoutWorld(world);
       pushFocus(world);
+      pushWorkspaces(world);
       return;
     }
   }
 });
 
 ipcMain.on('pty-write', (_e, { paneId, data }) => {
-  for (const world of worlds.values()) {
-    const pane = world.panes.get(paneId);
-    if (pane && pane.kind === 'term' && pane.pty) { try { pane.pty.write(data); } catch {} return; }
+  const found = findPaneGlobal(paneId);
+  if (found && found.pane.kind === 'term' && found.pane.pty) {
+    try { found.pane.pty.write(data); } catch {}
   }
 });
 
 ipcMain.on('pty-resize', (_e, { paneId, cols, rows }) => {
-  for (const world of worlds.values()) {
-    const pane = world.panes.get(paneId);
-    if (pane && pane.kind === 'term' && pane.pty) { try { pane.pty.resize(cols, rows); } catch {} return; }
+  const found = findPaneGlobal(paneId);
+  if (found && found.pane.kind === 'term' && found.pane.pty) {
+    try { found.pane.pty.resize(cols, rows); } catch {}
   }
 });
 
@@ -780,10 +914,30 @@ ipcMain.on('dispatch-action', (e, action) => {
   }
 });
 
+ipcMain.on('activate-workspace', (e, { idx }) => {
+  for (const world of worlds.values()) {
+    if (world.termView.webContents === e.sender) {
+      activateWorkspace(world, idx);
+      return;
+    }
+  }
+});
+
+ipcMain.on('rename-workspace', (e, { idx, name }) => {
+  for (const world of worlds.values()) {
+    if (world.termView.webContents === e.sender) {
+      const ws = world.workspaces[idx];
+      if (ws) { ws.name = String(name || '').slice(0, 32) || ws.name; pushWorkspaces(world); }
+      return;
+    }
+  }
+});
+
 ipcMain.on('tdub-browse', (e, { paneId, pid, url }) => {
   for (const world of worlds.values()) {
     if (world.termView.webContents !== e.sender) continue;
-    if (!world.panes.has(paneId)) return;
+    const ws = activeWs(world);
+    if (!ws || !ws.panes.has(paneId)) return;
     convertToBrowser(world, paneId, url, pid);
     return;
   }
@@ -791,9 +945,11 @@ ipcMain.on('tdub-browse', (e, { paneId, pid, url }) => {
 
 function findPaneByChromeWc(wc) {
   for (const world of worlds.values()) {
-    for (const pane of world.panes.values()) {
-      if (pane.kind === 'browser' && pane.chromeView.webContents === wc) {
-        return { world, pane };
+    for (const ws of world.workspaces) {
+      for (const pane of ws.panes.values()) {
+        if (pane.kind === 'browser' && pane.chromeView.webContents === wc) {
+          return { world, ws, pane };
+        }
       }
     }
   }
