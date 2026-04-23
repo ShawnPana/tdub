@@ -24,7 +24,10 @@ const DEFAULT_BINDINGS = {
   navDown:          ['Cmd+J'],
   navUp:            ['Cmd+K'],
   navRight:         ['Cmd+L'],
-  equalize:         ['Cmd+='],
+  zoomIn:           ['Cmd+='],
+  zoomOut:          ['Cmd+-'],
+  zoomReset:        ['Cmd+0'],
+  equalize:         ['Cmd+Alt+='],
   engage:           ['Cmd+Enter'],
   disengage:        ['Alt+Escape'],
 };
@@ -131,8 +134,11 @@ function loadConfigFromDisk() {
 
 function pushRuntimeConfig(world) {
   if (!world || !world.rendererReady || world.win.isDestroyed()) return;
+  const effectiveFontSize = Math.max(6, Math.min(72, termConfig.fontSize + (world.zoomDelta || 0)));
   world.termView.webContents.send('config-update', {
-    terminal: termConfig, panes: paneConfig, bindings,
+    terminal: { ...termConfig, fontSize: effectiveFontSize },
+    panes: paneConfig,
+    bindings,
   });
 }
 
@@ -499,6 +505,27 @@ function updateBrowserBorder(pane) {
   } catch {}
 }
 
+// Zoom: terminal panes scale xterm font size (affects all terminals in the
+// window); browser panes scale the page via webContents.setZoomFactor.
+// `step` is +1 / -1 (in/out) or 0 (reset).
+function applyZoom(world, step) {
+  const pane = world.panes.get(world.focusedPaneId);
+  if (pane && pane.kind === 'browser') {
+    try {
+      if (step === 0) pane.view.webContents.setZoomFactor(1);
+      else {
+        const cur = pane.view.webContents.getZoomFactor();
+        const next = Math.max(0.25, Math.min(5, cur + step * 0.1));
+        pane.view.webContents.setZoomFactor(next);
+      }
+    } catch {}
+    return;
+  }
+  if (step === 0) world.zoomDelta = 0;
+  else world.zoomDelta = (world.zoomDelta || 0) + step;
+  pushRuntimeConfig(world);
+}
+
 // ---------- browser pane conversion ----------
 
 function convertToBrowser(world, paneId, url, pid) {
@@ -611,6 +638,9 @@ function dispatchAction(world, action) {
     case 'navUp':       gotoDir(world, 'up'); return true;
     case 'navRight':    gotoDir(world, 'right'); return true;
     case 'equalize':    equalize(world.root); layoutWorld(world); return true;
+    case 'zoomIn':      applyZoom(world, +1); return true;
+    case 'zoomOut':     applyZoom(world, -1); return true;
+    case 'zoomReset':   applyZoom(world, 0); return true;
     case 'engage': {
       const p = world.panes.get(world.focusedPaneId);
       if (p && p.kind === 'browser') {
@@ -667,7 +697,7 @@ function newWindow() {
   const world = {
     win, termView,
     root: null, focusedPaneId: null, panes: new Map(),
-    rendererReady: false,
+    rendererReady: false, zoomDelta: 0,
   };
   worlds.set(win.id, world);
 
