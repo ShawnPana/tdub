@@ -434,8 +434,18 @@ function ptyEnv(shellSpecific = {}) {
   };
 }
 
+function resolveShell() {
+  if (termConfig.shell) return termConfig.shell;
+  if (process.env.SHELL) return process.env.SHELL;
+  // Finder-launched apps on macOS don't inherit $SHELL. Probe common paths.
+  for (const s of ['/bin/zsh', '/bin/bash', '/bin/sh']) {
+    try { if (fs.existsSync(s)) return s; } catch {}
+  }
+  return '/bin/sh';
+}
+
 function spawnPty(world, paneId, cols = 100, rows = 30) {
-  const shell = termConfig.shell || process.env.SHELL || '/bin/zsh';
+  const shell = resolveShell();
   const integ = shellIntegration(shell);
   const p = pty.spawn(shell, integ.args, {
     name: 'xterm-256color',
@@ -1124,7 +1134,7 @@ function newWindow() {
   termView.webContents.on('did-finish-load', () => {
     try { termView.webContents.setZoomFactor(1); } catch {}
   });
-  termView.webContents.loadFile('index.html');
+  termView.webContents.loadFile(path.join(APP_DIR, 'index.html'));
 
   const world = {
     win, termView,

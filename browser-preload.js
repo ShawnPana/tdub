@@ -17,7 +17,12 @@ try {
     { brand: 'Google Chrome', version: full },
     { brand: 'Not?A_Brand', version: '99.0.0.0' },
   ];
-  const platform = (navigator.userAgent || '').includes('Mac') ? 'macOS' : 'Unknown';
+  const ua = navigator.userAgent || '';
+  const platform =
+    ua.includes('Mac')      ? 'macOS'   :
+    ua.includes('Windows')  ? 'Windows' :
+    ua.includes('Linux')    ? 'Linux'   :
+    'Unknown';
   const fakeUAD = {
     brands,
     mobile: false,
