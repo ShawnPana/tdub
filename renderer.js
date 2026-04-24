@@ -64,6 +64,21 @@ function createTermPane(paneId) {
   term.open(host);
   term.onData((data) => ipcRenderer.send('pty-write', { paneId, data }));
 
+  // xterm.js's default: in the alternate screen buffer with no mouse
+  // tracking, a wheel event becomes an up/down arrow keystroke — the
+  // "scroll in `less`" convention. In TUIs with their own input loop
+  // (Claude Code, ink-based apps, REPLs) this surfaces as accidental
+  // history cycling when the user just meant to scroll.
+  // Only suppress the translation when mouse tracking is off, so apps
+  // that DO consume real wheel events (Claude Code's Ctrl+O transcript
+  // viewer binds wheelup/wheeldown to scroll) still work after they
+  // enable mouse reporting.
+  term.attachCustomWheelEventHandler((ev) => {
+    if (term.buffer.active.type !== 'alternate') return true;
+    if (term.modes && term.modes.mouseTrackingMode !== 'none') return true;
+    return false;
+  });
+
   // Per-term OSC 1983: browse / config / etc. fired from the pane's shell.
   term.parser.registerOscHandler(1983, (data) => {
     const semi = data.indexOf(';');
