@@ -1,4 +1,4 @@
-const { app, BrowserWindow, WebContentsView, ipcMain, session, dialog } = require('electron');
+const { app, BrowserWindow, WebContentsView, ipcMain, session, dialog, systemPreferences } = require('electron');
 
 const path = require('path');
 const os = require('os');
@@ -63,6 +63,7 @@ function initTmuxBackend() {
     unpackedDir: UNPACKED_DIR,
     userDataDir: app.getPath('userData'),
     getOverridePath: () => (termConfig && termConfig.tmuxPath) || '',
+    getScrollConfig: () => (termConfig && termConfig.scroll) || null,
   });
   return tmuxBackend;
 }
@@ -139,6 +140,16 @@ const DEFAULT_TERMINAL = {
   // copy at build/vendor/tmux-<arch>/tmux. Set to a path (e.g.
   // "/opt/homebrew/bin/tmux") to use your own.
   tmuxPath: null,
+  // Scroll mode (tmux copy-mode under the hood). Holds a frozen view of
+  // the pane's scrollback so you can scroll even in alt-buffer TUIs.
+  scroll: {
+    enterKey: 'Option+Tab',   // toggles scroll mode
+    upKey: 'i',               // active only while in scroll mode
+    downKey: 'k',
+    linesPerPress: 2,         // how far one press scrolls
+    fasterModifier: 'Shift',  // Shift | Ctrl | Alt
+    fasterMultiplier: 10,     // linesPerPress × this while modifier held
+  },
 };
 
 const DEFAULT_WINDOW = { width: 1000, height: 650 };
@@ -306,7 +317,12 @@ function applyParsedConfig(parsed, { resize } = { resize: true }) {
   }
 
   termConfig = mergeDeep(DEFAULT_TERMINAL, parsed && parsed.terminal);
-  if (tmuxBackend) tmuxBackend.invalidatePathCache();
+  if (tmuxBackend) {
+    tmuxBackend.invalidatePathCache();
+    // Re-emit the tmux conf so terminal.scroll edits apply to the
+    // already-running tmux server without a relaunch.
+    try { tmuxBackend.reloadConf(); } catch {}
+  }
   windowConfig = mergeDeep(DEFAULT_WINDOW, parsed && parsed.window);
   paneConfig = mergeDeep(DEFAULT_PANES, parsed && parsed.panes);
   workspaceConfig = mergeDeep(DEFAULT_WORKSPACES, parsed && parsed.workspaces);
@@ -1788,6 +1804,15 @@ ipcMain.on('nav-url', (e, raw) => {
 ipcMain.handle('omnibox-suggest', (_e, query) => combinedSuggest(query || ''));
 
 app.whenReady().then(() => {
+  // Disable macOS's press-and-hold accent picker inside this bundle. The
+  // popup eats autorepeat and swallows modifier keys while it's open,
+  // breaking tmux copy-mode scroll-mode (hold `i` → accent picker opens
+  // → Shift+I never reaches xterm). Must happen before the first
+  // WebContents is created; whenReady precedes any newWindow call.
+  if (process.platform === 'darwin') {
+    try { systemPreferences.setUserDefault('ApplePressAndHoldEnabled', 'boolean', false); } catch {}
+  }
+
   // Spoof client hints and ua-branding so Google sign-in doesn't treat us
   // as an embedded webview. Electron only reports "Chromium" by default;
   // real Chrome also reports a "Google Chrome" brand.

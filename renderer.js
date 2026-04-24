@@ -54,6 +54,11 @@ function createTermPane(paneId) {
     fontSize: termConfig.fontSize,
     cursorBlink: termConfig.cursorBlink,
     allowProposedApi: true,
+    // Option on macOS should send ESC+key (Meta) so tmux can bind chords
+    // like Option+Tab for scroll mode. Without this, macOS intercepts and
+    // Option+letter produces unicode characters (Option+F = ƒ, etc.) that
+    // neither tmux nor readline can act on.
+    macOptionIsMeta: true,
     theme: {
       background: termConfig.theme.background,
       foreground: termConfig.theme.foreground,
