@@ -112,11 +112,22 @@ const DEFAULT_WORKSPACES = {
   hoverForeground:  '#dddddd',
 };
 
+const DEFAULT_BROWSER = {
+  engagedBorderColor:    '#4a9eff',
+  disengagedBorderColor: '#1b1b1b',
+  loadingBarColor:       '#4a9eff',
+  chromeBackground:      '#1b1b1b',
+  chromeForeground:      '#bbbbbb',
+  urlBarBackground:      '#0d0d0d',
+  urlBarForeground:      '#dddddd',
+};
+
 let bindings = DEFAULT_BINDINGS;
 let termConfig = DEFAULT_TERMINAL;
 let windowConfig = DEFAULT_WINDOW;
 let paneConfig = DEFAULT_PANES;
 let workspaceConfig = DEFAULT_WORKSPACES;
+let browserConfig = DEFAULT_BROWSER;
 
 function parseChord(str) {
   const parts = String(str).split('+').map((s) => s.trim()).filter(Boolean);
@@ -220,6 +231,9 @@ function validateConfig(parsed) {
   if (parsed.workspaces !== undefined && (typeof parsed.workspaces !== 'object' || Array.isArray(parsed.workspaces))) {
     errors.push('workspaces must be an object');
   }
+  if (parsed.browser !== undefined && (typeof parsed.browser !== 'object' || Array.isArray(parsed.browser))) {
+    errors.push('browser must be an object');
+  }
 
   return errors;
 }
@@ -265,8 +279,25 @@ function loadConfigFromDisk() {
   windowConfig = mergeDeep(DEFAULT_WINDOW, parsed && parsed.window);
   paneConfig = mergeDeep(DEFAULT_PANES, parsed && parsed.panes);
   workspaceConfig = mergeDeep(DEFAULT_WORKSPACES, parsed && parsed.workspaces);
+  browserConfig = mergeDeep(DEFAULT_BROWSER, parsed && parsed.browser);
 
   for (const world of worlds.values()) pushRuntimeConfig(world);
+  // Live-update any open browser panes with the new theme.
+  for (const world of worlds.values()) {
+    for (const ws of world.workspaces) {
+      for (const pane of ws.panes.values()) {
+        if (pane.kind === 'browser') {
+          updateBrowserBorder(pane);
+          pushBrowserTheme(pane);
+        }
+      }
+    }
+  }
+}
+
+function pushBrowserTheme(pane) {
+  if (!pane || !pane.chromeView || pane.chromeView.webContents.isDestroyed()) return;
+  try { pane.chromeView.webContents.send('chrome-theme', browserConfig); } catch {}
 }
 
 function pushRuntimeConfig(world) {
@@ -320,6 +351,7 @@ function writeDefaultsFile() {
       window: DEFAULT_WINDOW,
       panes: DEFAULT_PANES,
       workspaces: DEFAULT_WORKSPACES,
+      browser: DEFAULT_BROWSER,
     };
     fs.writeFileSync(DEFAULTS_PATH, JSON.stringify(content, null, 2));
   } catch (e) { console.warn('[terminum] writeDefaultsFile:', e.message); }
@@ -742,7 +774,9 @@ function equalize(node) {
 
 function updateBrowserBorder(pane) {
   try {
-    pane.chromeView.setBackgroundColor(pane.engaged ? '#4a9eff' : '#1b1b1b');
+    pane.chromeView.setBackgroundColor(
+      pane.engaged ? browserConfig.engagedBorderColor : browserConfig.disengagedBorderColor
+    );
   } catch {}
 }
 
@@ -862,7 +896,7 @@ function convertToBrowser(world, paneId, url, pid) {
   const chromeView = new WebContentsView({
     webPreferences: { nodeIntegration: true, contextIsolation: false, sandbox: false },
   });
-  chromeView.setBackgroundColor('#1b1b1b');
+  chromeView.setBackgroundColor(browserConfig.disengagedBorderColor);
   chromeView.webContents.loadFile(CHROME_HTML);
 
   const bp = {
@@ -891,6 +925,14 @@ function convertToBrowser(world, paneId, url, pid) {
   view.webContents.on('did-navigate-in-page', onStateChange);
   view.webContents.on('did-finish-load', onStateChange);
   view.webContents.on('page-title-updated', onStateChange);
+
+  const pushLoading = (loading) => {
+    if (chromeView.webContents.isDestroyed()) return;
+    try { chromeView.webContents.send('loading-state', { loading }); } catch {}
+  };
+  bp.pushLoading = pushLoading;
+  view.webContents.on('did-start-loading', () => pushLoading(true));
+  view.webContents.on('did-stop-loading', () => pushLoading(false));
 
   const onInput = (event, input) => {
     if (handleBrowserPaneInput(world, bp, event, input)) event.preventDefault();
@@ -1227,7 +1269,9 @@ function findPaneByChromeWc(wc) {
 ipcMain.on('chrome-ready', (e) => {
   const found = findPaneByChromeWc(e.sender);
   if (!found) return;
+  pushBrowserTheme(found.pane);
   found.pane.pushNavState();
+  try { found.pane.pushLoading(found.pane.view.webContents.isLoading()); } catch {}
   if (found.pane.zoomFactor && found.pane.zoomFactor !== 1) {
     try { found.pane.chromeView.webContents.send('chrome-zoom', found.pane.zoomFactor); } catch {}
   }
@@ -1253,6 +1297,10 @@ ipcMain.on('nav-forward', (e) => {
 ipcMain.on('nav-reload', (e) => {
   const found = findPaneByChromeWc(e.sender);
   if (found) found.pane.view.webContents.reload();
+});
+ipcMain.on('nav-stop', (e) => {
+  const found = findPaneByChromeWc(e.sender);
+  if (found) found.pane.view.webContents.stop();
 });
 ipcMain.on('nav-url', (e, raw) => {
   const found = findPaneByChromeWc(e.sender);
@@ -1314,6 +1362,7 @@ function allDefaults() {
     window: DEFAULT_WINDOW,
     panes: DEFAULT_PANES,
     workspaces: DEFAULT_WORKSPACES,
+    browser: DEFAULT_BROWSER,
   };
 }
 

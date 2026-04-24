@@ -13,8 +13,10 @@
   .sub { color: #888; font-size: 11px; margin: 4px 0 16px; }
   h2 { font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: 0.6px;
        margin: 18px 0 6px; font-weight: 600; border-bottom: 1px solid #2a2a2a; padding-bottom: 4px; }
+  h3 { font-size: 10px; color: #666; text-transform: uppercase; letter-spacing: 0.6px;
+       margin: 10px 0 4px; font-weight: 600; }
   .row { display: flex; align-items: center; gap: 10px; padding: 3px 0; }
-  .row label { flex: 0 0 170px; color: #aaa; font-size: 12px; }
+  .row label { flex: 0 0 200px; color: #aaa; font-size: 12px; }
   input[type=text], input[type=number] {
     background: #0d0d0d; color: #ddd; border: 1px solid #333;
     padding: 4px 8px; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -27,6 +29,7 @@
     padding: 0; cursor: pointer; border-radius: 3px;
   }
   input[type=checkbox] { width: 15px; height: 15px; cursor: pointer; }
+  .nested { margin-left: 14px; border-left: 1px solid #222; padding-left: 12px; }
   .footer { padding: 10px 20px;
             background: #151515; border-top: 1px solid #2a2a2a;
             display: flex; gap: 10px; justify-content: flex-end; align-items: center;
@@ -43,38 +46,11 @@
 </head>
 <body>
   <div class="scroll">
-  <h1>Terminum Settings</h1>
-  <div class="sub">Saves to <code>~/.config/terminum/config.json</code>. Only values differing from defaults are written.</div>
-
-  <h2>Keybindings</h2>
-  <div class="sub" style="margin:0 0 8px">Comma-separated chords per action. Syntax: <code>Cmd+T</code>, <code>Cmd+Alt+Shift+N</code>, <code>Alt+ArrowLeft</code>. Case-insensitive.</div>
-  <div id="keybindings"></div>
-
-  <h2>Terminal</h2>
-  <div class="row"><label>Font family</label><input type="text" id="t-fontFamily" /></div>
-  <div class="row"><label>Font size</label><input type="number" id="t-fontSize" min="6" max="72" /></div>
-  <div class="row"><label>Cursor blink</label><input type="checkbox" id="t-cursorBlink" /></div>
-  <div class="row"><label>Background</label><input type="color" id="t-bg" /></div>
-  <div class="row"><label>Foreground</label><input type="color" id="t-fg" /></div>
-  <div class="row"><label>Shell override</label><input type="text" id="t-shell" placeholder="(default: $SHELL)" /></div>
-
-  <h2>Window</h2>
-  <div class="row"><label>Initial width</label><input type="number" id="w-width" min="200" /></div>
-  <div class="row"><label>Initial height</label><input type="number" id="w-height" min="200" /></div>
-
-  <h2>Panes</h2>
-  <div class="row"><label>Inactive border</label><input type="color" id="p-inactive" /></div>
-  <div class="row"><label>Focused border</label><input type="color" id="p-focused" /></div>
-  <div class="row"><label>Border width</label><input type="number" id="p-width" min="0" max="10" /></div>
-
-  <h2>Workspaces</h2>
-  <div class="row"><label>Wrap on cycle</label><input type="checkbox" id="ws-wrap" /></div>
-  <div class="row"><label>Bar background</label><input type="color" id="ws-bg" /></div>
-  <div class="row"><label>Bar foreground</label><input type="color" id="ws-fg" /></div>
-  <div class="row"><label>Active foreground</label><input type="color" id="ws-active" /></div>
-  <div class="row"><label>Border top</label><input type="color" id="ws-border" /></div>
-  <div class="row"><label>Hover background</label><input type="color" id="ws-hoverBg" /></div>
-  <div class="row"><label>Hover foreground</label><input type="color" id="ws-hoverFg" /></div>
+    <h1>Terminum Settings</h1>
+    <div class="sub">Fields are generated from the current defaults schema.
+      Values shown are your overrides from <code>~/.config/terminum/config.json</code>,
+      falling back to defaults. Saving only writes fields that differ from defaults.</div>
+    <div id="form"></div>
   </div>
 
   <div class="footer">
@@ -87,111 +63,178 @@
 <script>
 const { ipcRenderer } = require('electron');
 const $ = (id) => document.getElementById(id);
+
+// Section names we intentionally hide. Metadata keys in defaults.json.
+const SKIP_TOP_KEYS = new Set(['_comment', '_reference']);
+// Only top-level sections in this ordering — anything we don't know about
+// still renders, just alphabetized at the end.
+const SECTION_ORDER = ['keybindings', 'terminal', 'window', 'panes', 'workspaces', 'browser'];
+
 let defaults = null;
-const chordInputs = [];
+let current = null;
 
-function setVal(id, v) { $(id).value = v == null ? '' : v; }
-function val(id) { return $(id).value; }
+function formatLabel(key) {
+  // camelCase → "Sentence case"
+  return key.replace(/([A-Z])/g, ' $1').toLowerCase().replace(/^./, c => c.toUpperCase());
+}
 
-function renderKeybindings(bindings, defaultBindings) {
-  const div = $('keybindings');
-  div.innerHTML = '';
-  chordInputs.length = 0;
-  for (const action of Object.keys(defaultBindings)) {
-    const row = document.createElement('div');
-    row.className = 'row';
-    const label = document.createElement('label');
-    label.textContent = action;
-    const input = document.createElement('input');
+function isHexColor(s) {
+  return typeof s === 'string' && /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(s);
+}
+
+function getPath(obj, path) {
+  let v = obj;
+  for (const seg of path) {
+    if (v == null) return undefined;
+    v = v[seg];
+  }
+  return v;
+}
+
+function setPath(obj, path, value) {
+  let o = obj;
+  for (let i = 0; i < path.length - 1; i++) {
+    const seg = path[i];
+    if (typeof o[seg] !== 'object' || o[seg] === null || Array.isArray(o[seg])) o[seg] = {};
+    o = o[seg];
+  }
+  o[path[path.length - 1]] = value;
+}
+
+function renderLeaf(path, dv, cv, container) {
+  const row = document.createElement('div');
+  row.className = 'row';
+  const label = document.createElement('label');
+  label.textContent = formatLabel(path[path.length - 1]);
+  row.appendChild(label);
+
+  let input;
+  const attrPath = path.join('.');
+
+  if (typeof dv === 'boolean') {
+    input = document.createElement('input');
+    input.type = 'checkbox';
+    input.checked = typeof cv === 'boolean' ? cv : dv;
+    input.dataset.kind = 'bool';
+  } else if (typeof dv === 'number') {
+    input = document.createElement('input');
+    input.type = 'number';
+    input.value = typeof cv === 'number' ? cv : dv;
+    input.dataset.kind = 'number';
+  } else if (Array.isArray(dv)) {
+    input = document.createElement('input');
     input.type = 'text';
-    input.dataset.action = action;
     input.style.width = '260px';
-    const chords = bindings[action] !== undefined ? bindings[action] : defaultBindings[action];
-    input.value = Array.isArray(chords) ? chords.join(', ') : String(chords || '');
-    input.placeholder = (defaultBindings[action] || []).join(', ');
-    row.appendChild(label);
-    row.appendChild(input);
-    div.appendChild(row);
-    chordInputs.push(input);
+    const list = Array.isArray(cv) ? cv : dv;
+    input.value = list.join(', ');
+    input.dataset.kind = 'array';
+  } else if (isHexColor(dv)) {
+    input = document.createElement('input');
+    input.type = 'color';
+    const v = isHexColor(cv) ? cv : dv;
+    // color input needs 6-digit hex
+    input.value = v.length === 4
+      ? '#' + v.slice(1).split('').map(c => c + c).join('')
+      : v;
+    input.dataset.kind = 'color';
+  } else if (dv === null) {
+    // null default → optional string (e.g. terminal.shell).
+    input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = '(default: unset)';
+    input.value = typeof cv === 'string' ? cv : '';
+    input.dataset.kind = 'nullable-string';
+  } else {
+    input = document.createElement('input');
+    input.type = 'text';
+    input.value = typeof cv === 'string' ? cv : (dv == null ? '' : String(dv));
+    input.dataset.kind = 'string';
+  }
+  input.dataset.path = attrPath;
+  row.appendChild(input);
+  container.appendChild(row);
+}
+
+function renderFields(pathPrefix, defSection, curSection, container) {
+  for (const [k, dv] of Object.entries(defSection)) {
+    const path = [...pathPrefix, k];
+    const cv = curSection != null ? curSection[k] : undefined;
+    if (dv && typeof dv === 'object' && !Array.isArray(dv)) {
+      const h3 = document.createElement('h3');
+      h3.textContent = formatLabel(k);
+      container.appendChild(h3);
+      const nest = document.createElement('div');
+      nest.className = 'nested';
+      container.appendChild(nest);
+      renderFields(path, dv, cv && typeof cv === 'object' ? cv : {}, nest);
+    } else {
+      renderLeaf(path, dv, cv, container);
+    }
   }
 }
 
+function renderForm() {
+  const form = $('form');
+  form.innerHTML = '';
+
+  const topKeys = Object.keys(defaults).filter(k => !SKIP_TOP_KEYS.has(k));
+  topKeys.sort((a, b) => {
+    const ai = SECTION_ORDER.indexOf(a);
+    const bi = SECTION_ORDER.indexOf(b);
+    if (ai === -1 && bi === -1) return a.localeCompare(b);
+    if (ai === -1) return 1;
+    if (bi === -1) return -1;
+    return ai - bi;
+  });
+
+  for (const section of topKeys) {
+    const dv = defaults[section];
+    if (dv === null || dv === undefined) continue;
+    const h2 = document.createElement('h2');
+    h2.textContent = formatLabel(section);
+    form.appendChild(h2);
+    if (dv && typeof dv === 'object' && !Array.isArray(dv)) {
+      renderFields([section], dv, (current && current[section]) || {}, form);
+    } else {
+      renderLeaf([section], dv, current ? current[section] : undefined, form);
+    }
+  }
+}
+
+function readInput(input) {
+  switch (input.dataset.kind) {
+    case 'bool':            return input.checked;
+    case 'number': {
+      const n = Number(input.value);
+      return Number.isFinite(n) ? n : undefined;
+    }
+    case 'array':           return input.value.split(',').map(s => s.trim()).filter(Boolean);
+    case 'color':           return input.value;
+    case 'nullable-string': return input.value.trim() ? input.value : null;
+    case 'string':
+    default:                return input.value;
+  }
+}
+
+function collectForm() {
+  const out = {};
+  for (const input of document.querySelectorAll('#form [data-path]')) {
+    const path = input.dataset.path.split('.');
+    const v = readInput(input);
+    if (v === undefined) continue;
+    setPath(out, path, v);
+  }
+  return out;
+}
+
 ipcRenderer.on('config-ui-init', (_e, data) => {
-  defaults = data.defaults;
-  const cur = data.current || {};
-  const cT = cur.terminal || {};
-  const cTh = cT.theme || {};
-  const cW = cur.window || {};
-  const cP = (cur.panes && cur.panes.border) || {};
-  const cWs = cur.workspaces || {};
-  const dT = defaults.terminal;
-  const dW = defaults.window;
-  const dP = defaults.panes.border;
-  const dWs = defaults.workspaces;
-
-  renderKeybindings(cur.keybindings || {}, defaults.keybindings);
-
-  setVal('t-fontFamily', cT.fontFamily || dT.fontFamily);
-  setVal('t-fontSize', cT.fontSize != null ? cT.fontSize : dT.fontSize);
-  $('t-cursorBlink').checked = cT.cursorBlink !== undefined ? cT.cursorBlink : dT.cursorBlink;
-  setVal('t-bg', cTh.background || dT.theme.background);
-  setVal('t-fg', cTh.foreground || dT.theme.foreground);
-  setVal('t-shell', cT.shell || '');
-
-  setVal('w-width', cW.width || dW.width);
-  setVal('w-height', cW.height || dW.height);
-
-  setVal('p-inactive', cP.inactive || dP.inactive);
-  setVal('p-focused', cP.focused || dP.focused);
-  setVal('p-width', cP.width != null ? cP.width : dP.width);
-
-  $('ws-wrap').checked = cWs.wrap !== undefined ? cWs.wrap : dWs.wrap;
-  setVal('ws-bg', cWs.background || dWs.background);
-  setVal('ws-fg', cWs.foreground || dWs.foreground);
-  setVal('ws-active', cWs.activeForeground || dWs.activeForeground);
-  setVal('ws-border', cWs.borderTop || dWs.borderTop);
-  setVal('ws-hoverBg', cWs.hoverBackground || dWs.hoverBackground);
-  setVal('ws-hoverFg', cWs.hoverForeground || dWs.hoverForeground);
+  defaults = data.defaults || {};
+  current = data.current || {};
+  renderForm();
 });
 
 $('save').addEventListener('click', () => {
-  const keybindings = {};
-  for (const input of chordInputs) {
-    const chords = input.value.split(',').map(s => s.trim()).filter(Boolean);
-    if (chords.length) keybindings[input.dataset.action] = chords;
-  }
-  const shell = val('t-shell').trim();
-  const config = {
-    keybindings,
-    terminal: {
-      fontFamily: val('t-fontFamily'),
-      fontSize: parseInt(val('t-fontSize'), 10),
-      cursorBlink: $('t-cursorBlink').checked,
-      theme: { background: val('t-bg'), foreground: val('t-fg') },
-      shell: shell || null,
-    },
-    window: {
-      width: parseInt(val('w-width'), 10),
-      height: parseInt(val('w-height'), 10),
-    },
-    panes: {
-      border: {
-        inactive: val('p-inactive'),
-        focused: val('p-focused'),
-        width: parseInt(val('p-width'), 10),
-      },
-    },
-    workspaces: {
-      wrap: $('ws-wrap').checked,
-      background: val('ws-bg'),
-      foreground: val('ws-fg'),
-      activeForeground: val('ws-active'),
-      borderTop: val('ws-border'),
-      hoverBackground: val('ws-hoverBg'),
-      hoverForeground: val('ws-hoverFg'),
-    },
-  };
-  ipcRenderer.send('config-ui-save', config);
+  ipcRenderer.send('config-ui-save', collectForm());
 });
 
 $('close').addEventListener('click', () => {

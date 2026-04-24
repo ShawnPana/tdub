@@ -2,41 +2,60 @@
 <html>
 <head>
 <style>
-  html, body { margin: 0; padding: 0; height: 100%; background: #1b1b1b; color: #bbb;
+  :root {
+    --chrome-bg:     #1b1b1b;
+    --chrome-fg:     #bbbbbb;
+    --url-bg:        #0d0d0d;
+    --url-fg:        #dddddd;
+    --loading-color: #4a9eff;
+  }
+  html, body { margin: 0; padding: 0; height: 100%; background: var(--chrome-bg); color: var(--chrome-fg);
     font: 11px -apple-system, BlinkMacSystemFont, sans-serif;
     overflow: hidden; }
   body { -webkit-user-select: none; user-select: none; }
   #bar { display: flex; align-items: center; height: 28px; padding: 0 6px; gap: 4px; box-sizing: border-box; }
-  button { background: transparent; border: none; color: #bbb; width: 22px; height: 22px;
+  button { background: transparent; border: none; color: var(--chrome-fg); width: 22px; height: 22px;
     border-radius: 4px; cursor: pointer; font-size: 14px; line-height: 1; padding: 0;
     display: inline-flex; align-items: center; justify-content: center; }
   button:hover:not(:disabled) { background: rgba(255,255,255,0.08); color: #fff; }
   button:disabled { color: #555; cursor: default; }
   #url { flex: 1; min-width: 0; font: 11px ui-monospace, SFMono-Regular, monospace;
-    color: #ddd; padding: 3px 8px; background: #0d0d0d; border: 1px solid transparent;
+    color: var(--url-fg); padding: 3px 8px; background: var(--url-bg); border: 1px solid transparent;
     border-radius: 4px; outline: none; -webkit-user-select: text; user-select: text; }
   #url:focus { background: #050505; border-color: #3a3a3a; }
   #url::placeholder { color: #555; }
-  #suggestions { margin: 2px 6px 0; background: #0d0d0d; border: 1px solid #3a3a3a;
+  #suggestions { margin: 2px 6px 0; background: var(--url-bg); border: 1px solid #3a3a3a;
     border-radius: 4px; overflow: hidden; display: none; }
   #suggestions.visible { display: block; }
   .sugg-item { display: flex; align-items: center; gap: 8px;
-    padding: 5px 10px; cursor: pointer; color: #ddd;
+    padding: 5px 10px; cursor: pointer; color: var(--url-fg);
     font: 11px ui-monospace, SFMono-Regular, monospace;
     white-space: nowrap; overflow: hidden; }
   .sugg-item:hover, .sugg-item.active { background: #1e2c3a; color: #fff; }
   .sugg-icon { flex: 0 0 12px; width: 12px; text-align: center;
     color: #666; font-size: 11px; line-height: 1; }
   .sugg-item.active .sugg-icon { color: #fff; }
-  .sugg-title { color: #ddd; flex-shrink: 1; overflow: hidden; text-overflow: ellipsis; }
+  .sugg-title { color: var(--url-fg); flex-shrink: 1; overflow: hidden; text-overflow: ellipsis; }
   .sugg-url { color: #7a7a7a; flex: 1; overflow: hidden; text-overflow: ellipsis;
     font-size: 10px; }
-  .sugg-query { color: #ddd; flex: 1; overflow: hidden; text-overflow: ellipsis; }
+  .sugg-query { color: var(--url-fg); flex: 1; overflow: hidden; text-overflow: ellipsis; }
   .sugg-item.active .sugg-url { color: #a8c3dd; }
   .sugg-sep { color: #555; }
+  #loading { position: absolute; top: 0; left: 0; right: 0; height: 2px;
+    background: transparent; overflow: hidden; pointer-events: none;
+    opacity: 0; transition: opacity 120ms ease; z-index: 10; }
+  #loading.on { opacity: 1; }
+  #loading::after { content: ''; position: absolute; top: 0; bottom: 0;
+    width: 40%; background: linear-gradient(90deg, transparent, var(--loading-color), transparent);
+    animation: load-slide 1.1s ease-in-out infinite; }
+  @keyframes load-slide {
+    0%   { left: -40%; }
+    100% { left: 100%; }
+  }
 </style>
 </head>
 <body>
+  <div id="loading"></div>
   <div id="bar">
     <button id="back" title="Back" disabled>‹</button>
     <button id="forward" title="Forward" disabled>›</button>
@@ -61,7 +80,9 @@
 
   $('back').addEventListener('click', () => ipcRenderer.send('nav-back'));
   $('forward').addEventListener('click', () => ipcRenderer.send('nav-forward'));
-  $('reload').addEventListener('click', () => ipcRenderer.send('nav-reload'));
+  $('reload').addEventListener('click', () => {
+    ipcRenderer.send($('reload').title === 'Stop' ? 'nav-stop' : 'nav-reload');
+  });
 
   let suggestions = [];
   let activeIdx = -1;
@@ -207,6 +228,20 @@
   // chromeView loaded from the same file:// origin.
   ipcRenderer.on('chrome-zoom', (_e, factor) => {
     document.body.style.zoom = factor || 1;
+  });
+  ipcRenderer.on('loading-state', (_e, { loading }) => {
+    $('loading').classList.toggle('on', !!loading);
+    $('reload').textContent = loading ? '×' : '⟳';
+    $('reload').title = loading ? 'Stop' : 'Reload';
+  });
+  ipcRenderer.on('chrome-theme', (_e, t) => {
+    if (!t) return;
+    const r = document.documentElement.style;
+    if (t.chromeBackground) r.setProperty('--chrome-bg', t.chromeBackground);
+    if (t.chromeForeground) r.setProperty('--chrome-fg', t.chromeForeground);
+    if (t.urlBarBackground) r.setProperty('--url-bg', t.urlBarBackground);
+    if (t.urlBarForeground) r.setProperty('--url-fg', t.urlBarForeground);
+    if (t.loadingBarColor)  r.setProperty('--loading-color', t.loadingBarColor);
   });
   ipcRenderer.send('chrome-ready');
 </script>
